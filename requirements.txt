@@ -8,4 +8,5 @@ python-dotenv
 beautifulsoup4
 requests
 numpy
-pinecode
+pinecone-client
+pinecone
