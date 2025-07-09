@@ -9,14 +9,13 @@ from pinecone import Pinecone
 from sentence_transformers import SentenceTransformer, CrossEncoder, util, models
 from scipy.special import expit
 from dotenv import load_dotenv
-from nltk.tokenize import sent_tokenize
 from functools import lru_cache
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 import requests
 import nltk
 nltk.download('punkt')
-
+from nltk.tokenize import sent_tokenize
 # ─────────────────────────────────────────────────
 # CONFIGURATION & HYPERPARAMETERS
 # ─────────────────────────────────────────────────
