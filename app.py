@@ -14,7 +14,7 @@ from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 import requests
 import nltk
-nltk.download('punkt')
+nltk.data.path.append("nltk_data")
 from nltk.tokenize import sent_tokenize
 # ─────────────────────────────────────────────────
 # CONFIGURATION & HYPERPARAMETERS
