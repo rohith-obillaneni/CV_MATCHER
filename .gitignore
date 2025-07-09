@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+.streamlit/secrets.toml
+venv/
+model_cache/
+.venv/
+
+*.safetensors
+*.pt
+*.bin
+

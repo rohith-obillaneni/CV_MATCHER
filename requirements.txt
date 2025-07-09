@@ -1,0 +1,10 @@
+streamlit
+openai
+torch>=2.0.0
+sentence-transformers>=2.2.2
+scipy
+nltk
+python-dotenv
+beautifulsoup4
+requests
+numpy
