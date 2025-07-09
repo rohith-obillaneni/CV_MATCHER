@@ -38,10 +38,10 @@ index = pc.Index(PINECONE_INDEX)
 
 @st.cache_resource
 def load_models():
-    cross_encoder = CrossEncoder("cross-encoder/stsb-roberta-base", device="cpu")
+    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
     transformer = models.Transformer("BAAI/bge-large-en-v1.5")
     pooling = models.Pooling(transformer.get_word_embedding_dimension())
-    embedder = SentenceTransformer(modules=[transformer, pooling])
+    embedder = SentenceTransformer(modules=[transformer, pooling]) 
     embedder.to("cpu")
     return cross_encoder, embedder
 
