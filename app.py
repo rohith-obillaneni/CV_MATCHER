@@ -5,7 +5,7 @@ import json
 import openai
 import streamlit as st
 import numpy as np
-from pinecone import Pinecone
+import pinecone
 from sentence_transformers import SentenceTransformer, CrossEncoder, util, models
 from scipy.special import expit
 from dotenv import load_dotenv
@@ -33,7 +33,7 @@ MAX_EVIDENCE       = 3
 FUZZY_THRESHOLD    = 0.85
 
 openai.api_key = OPENAI_API_KEY
-pc = Pinecone(api_key=PINECONE_API_KEY)
+pc = pinecone.Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
 
 @st.cache_resource
@@ -359,12 +359,19 @@ q_vec = 0.7 * query_vec + 0.3 * skills_vec
 
 with st.spinner("Searching..."):
     try:
+        filter = {"tier": {"$eq": "A"}}
+        sector_value = sector_info.get("sector", "").strip()
+        if sector_value:
+            filter["sectors"] = {"$in": [sector_value]}
+            st.markdown(f"**Filtering by sector:** `{sector_value}`")
+
         resp = index.query(
             vector=q_vec.tolist(),
             top_k=TOP_K,
             include_metadata=True,
-            filter={"tier": {"$eq": "A"}}
+            filter=filter
         )
+
     except Exception as e:
         st.error(f"Pinecone error: {e}")
         st.stop()
