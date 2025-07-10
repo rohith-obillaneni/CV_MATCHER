@@ -13,6 +13,10 @@ from functools import lru_cache
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 import requests
+import asyncio
+import openai
+from openai import AsyncOpenAI
+
 import nltk
 nltk.data.path.append("nltk_data")
 from nltk.tokenize import sent_tokenize
@@ -35,10 +39,11 @@ FUZZY_THRESHOLD    = 0.85
 openai.api_key = OPENAI_API_KEY
 pc = pinecone.Pinecone(api_key=PINECONE_API_KEY)
 index = pc.Index(PINECONE_INDEX)
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 @st.cache_resource
 def load_models():
-    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
+    cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2", device="cpu")
     transformer = models.Transformer("BAAI/bge-large-en-v1.5")
     pooling = models.Pooling(transformer.get_word_embedding_dimension())
     embedder = SentenceTransformer(modules=[transformer, pooling]) 
@@ -122,26 +127,46 @@ def fetch_about_text(domain):
     return ""
 
 def infer_sector_from_text(about_text: str) -> dict:
-    prompt = f"""
-You are a neutral business analyst classifying company sectors.
+    ALLOWED_SECTORS = [
+        "FinTech", "Retail", "HealthTech", "EdTech", "LegalTech", "Market Research", "SaaS", "Consulting", "Analytics",
+        "AI", "Telecommunications", "Logistics", "Cybersecurity", "HRTech", "Manufacturing", "Finance",
+        "Media", "Nonprofit", "Public Sector"
+    ]
 
-Given the following 'About' section from a company's website, your task is to:
-1. Identify up to two primary sectors from this controlled list:
-["FinTech", "Retail", "HealthTech", "EdTech", "LegalTech", "Market Research", "SaaS", "Consulting", "Analytics", "AI", "Telecommunications", "Logistics", "Cybersecurity", "HRTech", "Manufacturing", "Finance", "Media", "Nonprofit", "Public Sector"].
-2. Classify by what the company does — not just its clients.
-3. If unclear, return empty sector and explain why — don’t hallucinate.
-4. Output valid JSON only in this format:
+    if not about_text or len(about_text.strip()) < 20:
+        return {"sector": [], "description": "No meaningful content found."}
+
+    ALLOWED_SECTORS = [
+    "FinTech", "Retail", "HealthTech", "EdTech", "LegalTech", "Market Research", 
+    "SaaS", "Consulting", "Analytics", "AI", "Telecommunications", "Logistics", 
+    "Cybersecurity", "HRTech", "Manufacturing", "Finance", "Media", "Nonprofit", "Public Sector"
+]
+
+    prompt = f"""
+You are a neutral business analyst.
+
+Given the following About section, your job is to classify the company based on what *they actually do*, not who they serve.
+
+ALLOWED SECTORS:
+{json.dumps(ALLOWED_SECTORS)}
+
+Instructions:
+- Focus only on the company's core function (e.g. "provides analytics services", "builds AI software", "offers consulting").
+- Do NOT label based on clients. For example, if a company says “we help retailers”, that does NOT make it a Retail company — it's more likely Market Research or Consulting.
+- Return up to two matching sectors from the list.
+- If unclear or ambiguous, return an empty sector list with explanation.
+
+Format your output as **strict JSON**:
 
 {{
   "sector": ["Sector1", "Sector2"],
   "description": "One-sentence neutral summary of what the company does."
 }}
 
-Company text:
+ABOUT:
 \"\"\"{about_text}\"\"\"
 """
-    if not about_text or len(about_text.strip()) < 50:
-        return {"sector": [], "description": "No meaningful content found."}
+
 
     try:
         resp = openai.chat.completions.create(
@@ -150,64 +175,106 @@ Company text:
             temperature=0
         )
         raw = resp.choices[0].message.content.strip()
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            print("[Parse Error] GPT response was not valid JSON:")
-            print(raw)
+
+        # Extract JSON only (ignore pre/post text if needed)
+        match = re.search(r"\{[\s\S]*\}", raw)
+        if not match:
+            print("[Sector Parse Error] No JSON object found in GPT response.")
             return {"sector": [], "description": "Unable to parse GPT response."}
 
+        parsed = json.loads(match.group(0))
+
+        # Validate sector list
         sector = parsed.get("sector", [])
         if isinstance(sector, str):
             sector = [sector]
-        elif not isinstance(sector, list):
+        if not isinstance(sector, list):
             sector = []
+
+        valid_sector = [s for s in sector if s in ALLOWED_SECTORS]
+
         return {
-            "sector": [s.strip() for s in sector if s.strip()],
+            "sector": valid_sector,
             "description": parsed.get("description", "").strip()
         }
 
     except Exception as e:
-        print(f"[GPT Error - Sector Inference] {e}")
+        print(f"[Sector GPT Error] {e}")
         return {"sector": [], "description": "Error during GPT sector inference."}
 
 # ─────────────────────────────────────
 # QUERY + SKILL EXTRACTION
 # ─────────────────────────────────────
+def extract_skills_from_query(query: str) -> list[str]:
+    prompt = f"""
+You are an expert CV screener.
+
+Extract only the top 3 to 7 **concrete, specific skills or competencies** from this sentence describing an ideal candidate.
+Focus on **clear nouns and actionable phrases** such as "machine learning", "strategic planning", "financial modelling", "client management", "leadership".
+Avoid vague, subjective, or generic terms such as "alignment with company needs", "exceptional", "proactive", or phrases that do not represent tangible skills.
+
+Output a **clean JSON list of skills** only.
+
+Candidate requirement:
+\"\"\"{query}\"\"\"
+"""
+    try:
+        resp = openai.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        skills = json.loads(resp.choices[0].message.content)
+        # Filter to remove very short or non-alpha tokens for robustness
+        filtered_skills = [s.strip().lower() for s in skills if isinstance(s, str) and len(s.strip()) > 2 and re.search(r'[a-zA-Z]', s)]
+        return filtered_skills
+    except Exception as e:
+        print(f"[Skill Extraction Error] {e}")
+        return []
+
+
 def clean_query(q: str) -> str:
     q = q.strip().strip("\"'")
     return re.sub(r'\b(seeking|tier a|best|candidates|professionals)\b', '', q, flags=re.I).strip()
 
 def generate_query(user_input: str, sector_hint: str = "", company_desc: str = "") -> str:
     hints = []
-    if sector_hint: hints.append(f"Sector: {sector_hint}.")
+    if sector_hint: hints.append(f"Sector: {', '.join(sector_hint) if isinstance(sector_hint, list) else sector_hint}.")
     if company_desc: hints.append(f"Company focus: {company_desc}")
     hint_txt = " ".join(hints)
+
     prompt = f"""
-You are an expert recruiter. Rewrite this into one precise sentence describing an ideal candidate's skills, sector, achievements, and experience. Be direct and concise. Fetch the sector from the query if it is url or company name and include it in the output{hint_txt}
+You are an expert recruiter.
 
-Input: "{user_input}"
+Rewrite the following user input into a **structured single sentence** that clearly describes an ideal candidate’s:
+- Sector (if known),
+- Core responsibilities or skills,
+- Key qualifications or achievements (if implied).
+
+❗ Use the hints provided (if any), but only if they add clarity.
+
+Do NOT hallucinate details. If the input is vague, keep the output broad but structured. Example output:
+"An experienced professional in FinTech with strong Python skills and a background in fraud detection."
+
+Hints: {hint_txt}
+
+Input:
+\"\"\"{user_input}\"\"\"
 """
-    resp = openai.chat.completions.create(
-        model="gpt-4",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-    print(hint_txt)
-    return clean_query(resp.choices[0].message.content)
 
-def extract_skills_from_query(query: str) -> list[str]:
-    prompt = f"""Extract the key skills from this sentence as a JSON list: \"{query}\""""
     try:
         resp = openai.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-        skills = json.loads(resp.choices[0].message.content)
-        return [s.lower() for s in skills if isinstance(s, str)]
-    except Exception:
-        return []
+        rewritten = resp.choices[0].message.content.strip()
+        if not rewritten or len(rewritten.split()) < 5:
+            return clean_query(user_input)
+        return clean_query(rewritten)
+    except Exception as e:
+        print(f"[Query Rewrite Error] {e}")
+        return clean_query(user_input)
 
 # ─────────────────────────────────────
 # EMBEDDING + EVIDENCE
@@ -226,21 +293,43 @@ def extract_evidence(query: str, cv_text: str, skills: list[str]) -> tuple[str, 
     sentences, sent_embs = get_sentence_embeddings(cv_text)
     if not sentences:
         return "No strong evidence found.", "none"
+
     query_emb = embedder.encode(query, convert_to_tensor=True)
-    scores = util.cos_sim(query_emb, sent_embs)[0]
-    scores = scores.cpu().numpy().tolist()
+    scores = util.cos_sim(query_emb, sent_embs)[0].cpu().numpy().tolist()
+
+    # Level 1: Query match
     candidates = [(sc, s) for sc, s in zip(scores, sentences) if sc >= MIN_SIM_THRESHOLD]
-    source = "query" if candidates else "none"
-    if not candidates and skills:
-        keywords = [kw for skill in skills for kw in re.findall(r'\w+', skill)]
-        candidates = [(sc, s) for sc, s in zip(scores, sentences)
-                      if any(kw in s.lower() for kw in keywords)]
-        source = "skills" if candidates else "none"
-    if not candidates:
-        return "No strong evidence found.", "none"
-    top_evidence = sorted(candidates, key=lambda x: x[0], reverse=True)[:MAX_EVIDENCE]
-    bullets = [f"\u2022 {s if s.endswith('.') else s + '.'}" for _, s in top_evidence]
-    return "\n".join(bullets), source
+    if candidates:
+        source = "query"
+        top = sorted(candidates, key=lambda x: x[0], reverse=True)
+        deduped = list(dict.fromkeys([s for _, s in top]))  # preserve order, remove duplicates
+        bullets = [f"• {s if s.endswith('.') else s + '.'}" for s in deduped[:MAX_EVIDENCE]]
+
+        return "\n".join(bullets), source
+
+    # Level 2: Skill-wise keyword matching
+    skill_matches = []
+    for skill in skills:
+        keywords = re.findall(r'\w+', skill.lower())
+        matched = [s for s in sentences if any(kw in s.lower() for kw in keywords)]
+        for m in matched:
+            skill_matches.append((skill, m))
+
+    if skill_matches:
+        source = "skills"
+        seen = set()
+        bullets = []
+        for skill, sent in skill_matches:
+            if len(bullets) >= MAX_EVIDENCE:
+                break
+            if sent not in seen:
+                bullets.append(f"• ({skill}) {sent.strip()}")
+                seen.add(sent)
+        return "\n".join(bullets), source
+
+    # Level 3: No evidence
+    return "No strong evidence found.", "none"
+
 
 # ─────────────────────────────────────
 # SCORING, LOGGING & UI
@@ -248,25 +337,53 @@ def extract_evidence(query: str, cv_text: str, skills: list[str]) -> tuple[str, 
 def fuzzy_match(skill: str, meta_skills: list[str]) -> bool:
     return any(SequenceMatcher(None, skill, ms.lower()).ratio() > FUZZY_THRESHOLD for ms in meta_skills)
 
-def explain_match_gpt(query, evidence):
-    prompt = f"""You're a hiring manager. ONLY using this evidence:
+async def explain_match_gpt_async(client, query: str, evidence: str) -> str:
+    prompt = f"""
+You are a fair and neutral hiring analyst.
 
+Only using the EVIDENCE below, and the REQUIREMENT sentence:
+
+REQUIREMENT: "{query}"
+
+EVIDENCE:
 {evidence}
 
-and this requirement: \"{query}\",
+Your task:
+- Write **3 concise, factual bullet points** explaining why this person fits the requirement.
+- Use **only the evidence** – do **not assume** anything not shown.
+- Avoid vague praise like "excellent", "strong", "clearly".
+- Each bullet should match one point from the requirement.
+- Use neutral language and avoid repetition.
+- If evidence is unclear, say so.
 
-Explain in 3 bullet points why this person is a strong match.
-Be specific and DO NOT include any information not present in the evidence.
+Format:
+- Bullet 1
+- Bullet 2
+- Bullet 3
 """
     try:
-        resp = openai.chat.completions.create(
+        response = await client.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3
+            temperature=0.2
         )
-        return resp.choices[0].message.content.strip()
+        return response.choices[0].message.content.strip()
     except Exception as e:
         return f"Explanation error: {e}"
+
+
+
+def semantic_skill_match(skill: str, meta_skills: list[str], threshold: float = 0.7) -> bool:
+    if not skill or not meta_skills:
+        return False
+    try:
+        skill_emb = embedder.encode(skill, convert_to_tensor=True)
+        meta_embs = embedder.encode(meta_skills, convert_to_tensor=True)
+        sims = util.cos_sim(skill_emb, meta_embs)[0]
+        return any(s.item() > threshold for s in sims)
+    except Exception as e:
+        print(f"[Semantic Skill Match Error] {e}")
+        return False
 
 def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -> list[dict]:
     raw_scores, logs, evidences, sources, explanations = [], [], [], [], []
@@ -275,28 +392,78 @@ def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -> list
     cross_raw = cross_encoder.predict(pairs)
     cross_probs = expit(cross_raw)
 
-    for i, m in enumerate(matches):
-        pine = m.get("score", 0)
-        cross = cross_probs[i]
-        raw = PINE_WEIGHT * pine + CROSS_WEIGHT * cross
-        evidence, source = extract_evidence(query, texts[i], skills)
-        if source == "none": raw *= 0.7
-        elif source == "skills": raw += 0.03
-        meta_skills = m["metadata"].get("skills", [])
-        matched_meta = any(fuzzy_match(skill, meta_skills) for skill in skills)
-        if matched_meta: raw += 0.05
-        gpt_expl = explain_match_gpt(query, evidence)
-        evidences.append(evidence)
-        sources.append(source)
-        explanations.append(gpt_expl)
-        raw_scores.append(raw)
-        logs.append((pine, cross, raw, source, matched_meta))
+    async def generate_explanations_batch():
+        tasks = []
+        for i, m in enumerate(matches):
+            pine = m.get("score", 0)
+            cross = cross_probs[i]
+            raw = PINE_WEIGHT * pine + CROSS_WEIGHT * cross
+            evidence, source = extract_evidence(query, texts[i], skills)
 
-    min_raw = min(raw_scores)
-    max_raw = max(raw_scores)
-    range_raw = max_raw - min_raw if max_raw != min_raw else 1e-6
-    final_norm = [(r - min_raw) / range_raw for r in raw_scores]
-    final_scores = [round(5 + s * 5, 2) for s in final_norm]
+            if source == "none":
+                raw *= 0.7
+            elif source == "skills":
+                raw += 0.03
+
+            meta_skills = m["metadata"].get("skills", [])
+            matched_fuzzy = any(fuzzy_match(skill, meta_skills) for skill in skills)
+            matched_semantic = any(semantic_skill_match(skill, meta_skills) for skill in skills)
+            matched_meta = matched_fuzzy or matched_semantic
+
+            if matched_meta:
+                raw += 0.05
+
+            evidences.append(evidence)
+            sources.append(source)
+            logs.append((pine, cross, raw, source, matched_meta))
+
+            tasks.append(explain_match_gpt_async(openai_client, query, evidence))
+
+        return await asyncio.gather(*tasks)
+
+    # Run all explanation requests in parallel
+    explanations = asyncio.run(generate_explanations_batch())
+
+    # Final score computation
+    raw_scores = [r[2] for r in logs]
+    mean_raw = np.mean(raw_scores)
+    std_raw = np.std(raw_scores) or 1e-6
+    z_scores = [(r - mean_raw) / std_raw for r in raw_scores]
+    final_scores = [round(max(4.5, min(7.5 + z * 2.5, 10.0)), 2) for z in z_scores]
+
+    def score_label(score):
+        if score >= 9.0: return "\U0001F7E2 Perfect Match"
+        elif score >= 7.5: return "\U0001F7E1 Strong Fit"
+        elif score >= 5.0: return "\U0001F7E0 Moderate Fit"
+        return "\U0001F534 Weak Fit"
+
+    results = []
+    for i, (m, ev, src, expl, log, score) in enumerate(zip(matches, evidences, sources, explanations, logs, final_scores), 1):
+        pine, cross, raw, _, matched_meta = log
+        log_scaled = {
+            "pinecone_score": float(np.log1p(pine)),
+            "cross_score": float(np.log1p(cross)),
+            "combined_raw_score": float(np.log1p(raw))
+        }
+        results.append({
+            "name": m["metadata"].get("name", "Unnamed"),
+            "cv_link": m["metadata"].get("cv_link", ""),
+            "score": score,
+            "score_label": score_label(score),
+            "evidence": ev,
+            "explanation": expl,
+            "evidence_source": src,
+            "log": {
+                "pinecone_score": pine,
+                "cross_score": cross,
+                "matched_metadata": matched_meta,
+                "raw_score": raw,
+                "log_scaled": log_scaled
+            }
+        })
+
+    return sorted(results, key=lambda x: x["score"], reverse=True)
+
 
     def score_label(score):
         if score >= 9.0: return "\U0001F7E2 Perfect Match"
@@ -346,21 +513,22 @@ if is_probable_domain(user_input):
     st.markdown("### 🧪 Website Analysis")
     st.markdown(f"**Domain:** `{domain}`")
     about_text = fetch_about_text(domain)
-
-    if not about_text:
-        print("[DEBUG] No content extracted from website.")
     if about_text:
-        st.markdown("**Extracted About Text (preview):**")
-        st.code(about_text[:500])
         sector_info = infer_sector_from_text(about_text)
+else:
+    about_text = user_input
+    sector_info = infer_sector_from_text(about_text)
 
-        if sector_info.get("sector"):
-            st.markdown("**Inferred Company Sector:**")
-            st.json(sector_info)
-        else:
-            st.warning("Sector could not be inferred from website text.")
-    else:
-        st.error("No usable content found on the website.")
+# ✅ This part shows about_text and sector info for both cases
+if about_text:
+    st.markdown("**Extracted About Text (preview):**")
+    st.code(about_text[:500])
+
+if sector_info.get("sector"):
+    st.markdown("**Inferred Company Sector:**")
+    st.json(sector_info)
+else:
+    st.warning("Sector could not be inferred from text.")
 
 
 with st.spinner("Rewriting query..."):
@@ -375,28 +543,33 @@ skills_extracted = extract_skills_from_query(query)
 st.markdown(f"**Skills extracted:** {skills_extracted}")
 
 query_vec = get_cached_embedding(query)
-skills_vec = get_cached_embedding(", ".join(skills_extracted))
-q_vec = 0.7 * query_vec + 0.3 * skills_vec
+skills_vec = get_cached_embedding(", ".join(skills_extracted)) if skills_extracted else None
+
+# Adaptive blending
+if skills_vec is not None:
+    q_vec = 0.75 * query_vec + 0.25 * skills_vec
+else:
+    q_vec = query_vec
 
 with st.spinner("Searching..."):
     try:
-        sectors = sector_info.get("sector", [])
-        if isinstance(sectors, str):
-            sectors = [sectors]
-        elif not isinstance(sectors, list):
-            sectors = []
-
-        filter = {"tier": {"$eq": "A"}}
+        # Clean and validate sector info
+        raw_sectors = sector_info.get("sector", [])
+        sectors = [s.strip() for s in raw_sectors if isinstance(s, str) and s.strip()]
+        
+        # Build safe filter
+        base_filter = {"tier": {"$eq": "A"}}
         if sectors:
-            filter["sectors"] = {"$in": sectors}
-            st.markdown(f"**Filtering by sector(s):** `{', '.join(sectors)}`")
-
+            base_filter["sectors"] = {"$in": sectors}
+            st.markdown(f"**Filtering by inferred sector(s):** `{', '.join(sectors)}`")
+        else:
+            st.warning("⚠️ No reliable sector detected — running unfiltered Tier-A match.")
 
         resp = index.query(
             vector=q_vec.tolist(),
             top_k=TOP_K,
             include_metadata=True,
-            filter=filter
+            filter=base_filter
         )
 
     except Exception as e:
