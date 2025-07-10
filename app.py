@@ -28,7 +28,7 @@ TOP_K              = 10
 PINE_WEIGHT        = 0.6
 CROSS_WEIGHT       = 0.4
 FINAL_SCALE        = 10.0
-MIN_SIM_THRESHOLD  = 0.6
+MIN_SIM_THRESHOLD  = 0.55
 MAX_EVIDENCE       = 3
 FUZZY_THRESHOLD    = 0.85
 
@@ -121,22 +121,28 @@ def fetch_about_text(domain):
     print(f"[Fetch Fail] No valid content at {domain}")
     return ""
 
-
 def infer_sector_from_text(about_text: str) -> dict:
-    if not about_text or len(about_text.strip()) < 50:
-        print("[Sector Inference] Not enough text.")
-        return {"sector": "", "description": ""}
-
     prompt = f"""
-The following is an About Us section of a company:
-\"\"\"{about_text}\"\"\"
+You are a neutral business analyst classifying company sectors.
 
-Identify the company’s primary industry sector (e.g. FinTech, HealthTech, Retail, Logistics, EdTech), and give a 1-sentence summary of what they do. Return JSON like:
+Given the following 'About' section from a company's website, your task is to:
+1. Identify up to two primary sectors from this controlled list:
+["FinTech", "Retail", "HealthTech", "EdTech", "LegalTech", "Market Research", "SaaS", "Consulting", "Analytics", "AI", "Telecommunications", "Logistics", "Cybersecurity", "HRTech", "Manufacturing", "Finance", "Media", "Nonprofit", "Public Sector"].
+2. Classify by what the company does — not just its clients.
+3. If unclear, return empty sector and explain why — don’t hallucinate.
+4. Output valid JSON only in this format:
+
 {{
-  "sector": "FinTech",
-  "description": "Provides global payment infrastructure for cross-border businesses."
+  "sector": ["Sector1", "Sector2"],
+  "description": "One-sentence neutral summary of what the company does."
 }}
+
+Company text:
+\"\"\"{about_text}\"\"\"
 """
+    if not about_text or len(about_text.strip()) < 50:
+        return {"sector": [], "description": "No meaningful content found."}
+
     try:
         resp = openai.chat.completions.create(
             model="gpt-4",
@@ -144,11 +150,26 @@ Identify the company’s primary industry sector (e.g. FinTech, HealthTech, Reta
             temperature=0
         )
         raw = resp.choices[0].message.content.strip()
-        print("[GPT Output]", raw)
-        return json.loads(raw)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            print("[Parse Error] GPT response was not valid JSON:")
+            print(raw)
+            return {"sector": [], "description": "Unable to parse GPT response."}
+
+        sector = parsed.get("sector", [])
+        if isinstance(sector, str):
+            sector = [sector]
+        elif not isinstance(sector, list):
+            sector = []
+        return {
+            "sector": [s.strip() for s in sector if s.strip()],
+            "description": parsed.get("description", "").strip()
+        }
+
     except Exception as e:
-        print(f"[GPT Error] {e}")
-        return {"sector": "", "description": ""}
+        print(f"[GPT Error - Sector Inference] {e}")
+        return {"sector": [], "description": "Error during GPT sector inference."}
 
 # ─────────────────────────────────────
 # QUERY + SKILL EXTRACTION
@@ -359,11 +380,17 @@ q_vec = 0.7 * query_vec + 0.3 * skills_vec
 
 with st.spinner("Searching..."):
     try:
+        sectors = sector_info.get("sector", [])
+        if isinstance(sectors, str):
+            sectors = [sectors]
+        elif not isinstance(sectors, list):
+            sectors = []
+
         filter = {"tier": {"$eq": "A"}}
-        sector_value = sector_info.get("sector", "").strip()
-        if sector_value:
-            filter["sectors"] = {"$in": [sector_value]}
-            st.markdown(f"**Filtering by sector:** `{sector_value}`")
+        if sectors:
+            filter["sectors"] = {"$in": sectors}
+            st.markdown(f"**Filtering by sector(s):** `{', '.join(sectors)}`")
+
 
         resp = index.query(
             vector=q_vec.tolist(),
