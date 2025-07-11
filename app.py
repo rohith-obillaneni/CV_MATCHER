@@ -209,6 +209,12 @@ ABOUT:
 # QUERY + SKILL EXTRACTION
 # ─────────────────────────────────────
 def extract_skills_from_query(query: str) -> list[str]:
+    VAGUE_TERMS = {
+        "professional background", "experience", "expertise", "background",
+        "knowledge", "understanding", "skills", "ability", "competence",
+        "capability", "track record", "acumen", "career"
+    }
+
     prompt = f"""
 You are an expert CV screener.
 
@@ -221,6 +227,7 @@ Output a **clean JSON list of skills** only.
 Candidate requirement:
 \"\"\"{query}\"\"\"
 """
+
     try:
         resp = openai.chat.completions.create(
             model="gpt-4",
@@ -228,43 +235,51 @@ Candidate requirement:
             temperature=0,
         )
         skills = json.loads(resp.choices[0].message.content)
-        # Filter to remove very short or non-alpha tokens for robustness
-        filtered_skills = [s.strip().lower() for s in skills if isinstance(s, str) and len(s.strip()) > 2 and re.search(r'[a-zA-Z]', s)]
+
+        filtered_skills = []
+        for s in skills:
+            if not isinstance(s, str): continue
+            s_clean = s.strip().lower()
+            if len(s_clean) <= 2: continue
+            if not re.search(r"[a-zA-Z]", s_clean): continue
+            if s_clean in VAGUE_TERMS: continue
+            filtered_skills.append(s_clean)
+
         return filtered_skills
+
     except Exception as e:
         print(f"[Skill Extraction Error] {e}")
         return []
 
 
 def clean_query(q: str) -> str:
-    q = q.strip().strip("\"'")
-    return re.sub(r'\b(seeking|tier a|best|candidates|professionals)\b', '', q, flags=re.I).strip()
+    q = re.sub(r"\b(professionals?|candidates?|individuals?|leaders?|background(?: in)?|experience(?: in)?)\b", "", q, flags=re.I)
+    q = re.sub(r"[\"'“”‘’,.]+", "", q)
+    return re.sub(r'\s+', ' ', q.strip())
 
 def generate_query(user_input: str, sector_hint: str = "", company_desc: str = "") -> str:
     hints = []
-    if sector_hint: hints.append(f"Sector: {', '.join(sector_hint) if isinstance(sector_hint, list) else sector_hint}.")
-    if company_desc: hints.append(f"Company focus: {company_desc}")
+    if sector_hint: 
+        hints.append(f"Sector: {', '.join(sector_hint) if isinstance(sector_hint, list) else sector_hint}.")
+    if company_desc: 
+        hints.append(f"Company focus: {company_desc}")
     hint_txt = " ".join(hints)
 
     prompt = f"""
 You are an expert recruiter.
 
-Rewrite the following user input into a **structured single sentence** that clearly describes an ideal candidate’s:
-- Sector (if known),
-- Core responsibilities or skills,
-- Key qualifications or achievements (if implied).
+Rewrite the following user input into **one precise sentence** describing an ideal candidate’s:
+- Sector/domain (if known),
+- Core responsibilities or competencies,
+- Measurable qualifications or tools.
 
-❗ Use the hints provided (if any), but only if they add clarity.
-
-Do NOT hallucinate details. If the input is vague, keep the output broad but structured. Example output:
-"An experienced professional in FinTech with strong Python skills and a background in fraud detection."
+✅ Use tangible skill nouns only, like "financial modelling", "Python development", "strategic planning".
 
 Hints: {hint_txt}
 
 Input:
 \"\"\"{user_input}\"\"\"
 """
-
     try:
         resp = openai.chat.completions.create(
             model="gpt-4",
@@ -272,9 +287,7 @@ Input:
             temperature=0
         )
         rewritten = resp.choices[0].message.content.strip()
-        if not rewritten or len(rewritten.split()) < 5:
-            return clean_query(user_input)
-        return clean_query(rewritten)
+        return clean_query(rewritten or user_input)
     except Exception as e:
         print(f"[Query Rewrite Error] {e}")
         return clean_query(user_input)
@@ -331,7 +344,10 @@ def extract_evidence(query: str, cv_text: str, skills: list[str]) -> tuple[str, 
         return "\n".join(bullets), source
 
     # Level 3: No evidence
-    return "No strong evidence found.", "none"
+    if not sentences:
+        fallback = cv_text.strip()[:400]
+        return f"No long sentence evidence found. Fallback preview:\n• {fallback}", "none"
+
 
 
 # ─────────────────────────────────────
@@ -574,6 +590,14 @@ with st.spinner("Searching..."):
             include_metadata=True,
             filter=base_filter
         )
+
+        matches = resp.get("matches", [])
+
+        # ✅ Normalise cosine similarity from [-1, 1] to [0, 1]
+        for m in matches:
+            raw_score = m.get("score", 0.0)
+            m["score"] = max(0.0, min((raw_score + 1) / 2, 1.0))  # Clamp to [0, 1]
+
 
     except Exception as e:
         st.error(f"Pinecone error: {e}")
