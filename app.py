@@ -127,72 +127,75 @@ def fetch_about_text(domain):
     return ""
 
 def infer_sector_from_text(about_text: str) -> dict:
+    # Extended, distinct, and semantically disambiguated list of sectors
     ALLOWED_SECTORS = [
-        "FinTech", "Retail", "HealthTech", "EdTech", "LegalTech", "Market Research", "SaaS", "Consulting", "Analytics",
-        "AI", "Telecommunications", "Logistics", "Cybersecurity", "HRTech", "Manufacturing", "Finance",
-        "Media", "Nonprofit", "Public Sector"
+        "Marketing Agency", "Market Research", "FinTech", "Retail", "HealthTech", "EdTech", "LegalTech",
+        "SaaS", "Consulting", "Analytics", "AI", "Telecommunications", "Logistics", "Cybersecurity",
+        "HRTech", "Manufacturing", "Finance", "Media", "Nonprofit", "Public Sector"
     ]
 
-    if not about_text or len(about_text.strip()) < 20:
-        return {"sector": [], "description": "No meaningful content found."}
-
-    ALLOWED_SECTORS = [
-    "FinTech", "Retail", "HealthTech", "EdTech", "LegalTech", "Market Research", 
-    "SaaS", "Consulting", "Analytics", "AI", "Telecommunications", "Logistics", 
-    "Cybersecurity", "HRTech", "Manufacturing", "Finance", "Media", "Nonprofit", "Public Sector"
-]
+    if not about_text or len(about_text.strip()) < 30:
+        return {"sector": [], "description": "No meaningful content found to classify."}
 
     prompt = f"""
-You are a neutral business analyst.
+You are a neutral and highly precise business analyst.
 
-Given the following About section, your job is to classify the company based on what *they actually do*, not who they serve.
+Your task is to classify the company based ONLY on its actual business function as described in the ABOUT section below.
 
 ALLOWED SECTORS:
 {json.dumps(ALLOWED_SECTORS)}
 
-Instructions:
-- Focus only on the company's core function (e.g. "provides analytics services", "builds AI software", "offers consulting").
-- Do NOT label based on clients. For example, if a company says “we help retailers”, that does NOT make it a Retail company — it's more likely Market Research or Consulting.
-- Return up to two matching sectors from the list.
-- If unclear or ambiguous, return an empty sector list with explanation.
+⚠️ Important Rules:
+- Only use the information in the ABOUT section.
+- Focus on the company's own core activities (e.g. "runs advertising campaigns", "provides analytics services").
+- DO NOT label based on who the company helps (e.g. “we help retailers” ≠ Retail).
+- DO NOT infer or assume missing details.
+- If the description is vague or unclear, return an empty sector list with explanation.
 
-Format your output as **strict JSON**:
+🧠 Disambiguation Example:
+- “We create and manage advertising campaigns for B2B firms” → ["Marketing Agency"]
+- “We conduct surveys and generate consumer insights for B2B” → ["Market Research"]
 
+Return:
+- A JSON object with:
+  • sector: list of up to 2 sectors (from ALLOWED_SECTORS only)
+  • description: 1 neutral sentence stating what the company does
+
+Format:
 {{
   "sector": ["Sector1", "Sector2"],
-  "description": "One-sentence neutral summary of what the company does."
+  "description": "One-sentence summary of the company’s function."
 }}
 
 ABOUT:
-\"\"\"{about_text}\"\"\"
-"""
-
+\"\"\"{about_text.strip()}\"\"\"
+""".strip()
 
     try:
-        resp = openai.chat.completions.create(
+        response = openai.chat.completions.create(
             model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             temperature=0
         )
-        raw = resp.choices[0].message.content.strip()
 
-        # Extract JSON only (ignore pre/post text if needed)
+        raw = response.choices[0].message.content.strip()
+
+        # Strict JSON extraction
         match = re.search(r"\{[\s\S]*\}", raw)
         if not match:
-            print("[Sector Parse Error] No JSON object found in GPT response.")
-            return {"sector": [], "description": "Unable to parse GPT response."}
+            print("[Sector Parse Error] No JSON object found.")
+            return {"sector": [], "description": "Invalid GPT output format."}
 
         parsed = json.loads(match.group(0))
 
-        # Validate sector list
         sector = parsed.get("sector", [])
         if isinstance(sector, str):
             sector = [sector]
         if not isinstance(sector, list):
             sector = []
 
+        # Enforce validity and prevent hallucinated sectors
         valid_sector = [s for s in sector if s in ALLOWED_SECTORS]
-
         return {
             "sector": valid_sector,
             "description": parsed.get("description", "").strip()
@@ -200,7 +203,7 @@ ABOUT:
 
     except Exception as e:
         print(f"[Sector GPT Error] {e}")
-        return {"sector": [], "description": "Error during GPT sector inference."}
+        return {"sector": [], "description": "Error during GPT-based classification."}
 
 # ─────────────────────────────────────
 # QUERY + SKILL EXTRACTION
