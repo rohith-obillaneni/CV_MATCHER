@@ -11,3 +11,4 @@ model_cache/
 *.bin
 
 draft.py
+sample.py
