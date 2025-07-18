@@ -672,7 +672,7 @@ async def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -
         final_score = calculate_quality_score(
             detailed_profile, skills, query, pine_score, cross_score, source, matched_meta
         )
-        final_score = final_score +1.5
+        final_score = final_score +1.0
         results_data.append({
             "name": m["metadata"].get("name", "Unnamed"),
             "cv_link": m["metadata"].get("cv_link", ""),
