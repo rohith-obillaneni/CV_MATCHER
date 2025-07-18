@@ -52,10 +52,6 @@ openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Ensure NLTK data is available
 import nltk
-try:
-    nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
-    nltk.download('punkt', download_dir="nltk_data")
 nltk.data.path.append("nltk_data")
 from nltk.tokenize import sent_tokenize
 
