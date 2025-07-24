@@ -5,14 +5,15 @@ import openai
 import streamlit as st
 import numpy as np
 import pinecone
+import requests
+import cloudscraper # Essential for robust fetching
+import asyncio
 from sentence_transformers import SentenceTransformer, CrossEncoder, util, models
 from scipy.special import expit # For sigmoid activation on cross-encoder scores
 from dotenv import load_dotenv
 from functools import lru_cache
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
-import requests
-import asyncio
 from openai import AsyncOpenAI
 from urllib.parse import urljoin, urlparse
 
@@ -27,19 +28,19 @@ PINECONE_INDEX = "head-of-ai"
 TOP_K = 10
 
 # --- SCORING WEIGHTS RE-CALIBRATED FOR HIGHER, MORE ACCURATE SCORES ---
-PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION = 0.25  # Increased for stronger base contribution
-CROSS_ENCODER_MAX_POINTS = 2.50             # Increased for stronger relevance signal
-SKILL_COVERAGE_MAX_POINTS = 3.0            # Increased to better reward specific skill matches
-RELEVANT_EXPERIENCE_MAX_POINTS = 4.0       # HEAVILY INCREASED to better reward senior candidates (distribution refined below)
-ACHIEVEMENT_MAX_POINTS = 2.5              # Increased to reward demonstrated impact more significantly
-SENIORITY_MAX_POINTS = 1.25                 # Increased to strongly reward senior titles
-PROBLEM_SOLVING_MAX_POINTS = 1.25           # Increased
-METADATA_SKILL_BONUS = 0.35                # Maintained
-EVIDENCE_SOURCE_BONUS_QUERY = 0.15         # Maintained
-EVIDENCE_SOURCE_BONUS_SKILLS = 0.1         # Maintained
-EVIDENCE_SOURCE_PENALTY_NONE = -0.1        # Reduced penalty for no explicit evidence
+PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION = 0.25
+CROSS_ENCODER_MAX_POINTS = 2.50
+SKILL_COVERAGE_MAX_POINTS = 3.0
+RELEVANT_EXPERIENCE_MAX_POINTS = 4.0
+ACHIEVEMENT_MAX_POINTS = 2.5
+SENIORITY_MAX_POINTS = 1.25
+PROBLEM_SOLVING_MAX_POINTS = 1.25
+METADATA_SKILL_BONUS = 0.35
+EVIDENCE_SOURCE_BONUS_QUERY = 0.15
+EVIDENCE_SOURCE_BONUS_SKILLS = 0.1
+EVIDENCE_SOURCE_PENALTY_NONE = -0.1
 
-CROSS_ENCODER_MIN_CONTRIBUTION = 0.4       # Lowered to give points to moderately relevant candidates
+CROSS_ENCODER_MIN_CONTRIBUTION = 0.4
 MIN_SIM_THRESHOLD = 0.55
 MAX_EVIDENCE = 3
 FUZZY_THRESHOLD = 0.85
@@ -88,86 +89,75 @@ def _extract_links_from_page(soup, base_url, max_links=10):
     parsed_base_url = urlparse(base_url)
     base_domain = parsed_base_url.netloc
 
-    nav_tags = soup.find_all(['nav'])
-    for nav in nav_tags:
-        for a in nav.find_all('a', href=True):
-            full_url = urljoin(base_url, a['href'])
-            parsed_full_url = urlparse(full_url)
-            if parsed_full_url.netloc == base_domain and parsed_full_url.path not in ["/", ""]:
-                links.add(full_url)
-                if len(links) >= max_links:
-                    return list(links)
-
-    if len(links) < max_links:
-        for a in soup.find_all('a', href=True):
-            full_url = urljoin(base_url, a['href'])
-            parsed_full_url = urlparse(full_url)
-            if parsed_full_url.netloc == base_domain and \
-               not parsed_full_url.query and not parsed_full_url.fragment and \
-               not re.search(r'\.(pdf|zip|jpg|png|gif|xml|rss)$', parsed_full_url.path.lower()) and \
-               parsed_full_url.path not in ["/", ""] and \
-               "contact" not in parsed_full_url.path.lower() and \
-               "careers" not in parsed_full_url.path.lower():
-                links.add(full_url)
-                if len(links) >= max_links:
-                    break
+    for a in soup.find_all('a', href=True):
+        full_url = urljoin(base_url, a['href'])
+        parsed_full_url = urlparse(full_url)
+        if parsed_full_url.netloc == base_domain and \
+           not parsed_full_url.query and not parsed_full_url.fragment and \
+           not re.search(r'\.(pdf|zip|jpg|png|gif|xml|rss)$', parsed_full_url.path.lower()) and \
+           parsed_full_url.path not in ["/", ""] and \
+           "contact" not in parsed_full_url.path.lower() and \
+           "careers" not in parsed_full_url.path.lower():
+            links.add(full_url)
+            if len(links) >= max_links:
+                break
     return list(links)
 
 async def fetch_and_process_website_content(domain: str) -> str:
-    domain = domain.strip().lower()
-    domain = domain.replace("https://", "").replace("http://", "").split("/")[0]
-    base_url = f"https://{domain}"
+    """
+    Fetches and processes website content with a robust, multi-step approach.
+    """
+    domain = domain.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
+    
+    # Heuristic: Try the /about page first, as it's often content-rich, then fall back to the root.
+    urls_to_try = [
+        f"https://{domain}/about",
+        f"https://{domain}/"
+    ]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; CVMatcherBot/1.0; +https://yourwebsite.com/bot)"
-    }
-    content_pool = []
-    visited_urls = set()
-    urls_to_visit = [base_url]
-    crawl_limit = 5
+    scraper = cloudscraper.create_scraper()
+    res = None
+    fetched_url = ""
 
-    for current_url in urls_to_visit:
-        if current_url in visited_urls or len(visited_urls) > crawl_limit:
-            continue
-        visited_urls.add(current_url)
-
+    # Try to fetch from the list of potential URLs
+    for url in urls_to_try:
         try:
-            res = requests.get(current_url, timeout=8, headers=headers)
+            response = scraper.get(url, timeout=15)
+            if response.status_code == 200 and "text/html" in response.headers.get("Content-Type", ""):
+                res = response
+                fetched_url = url
+                break # Stop on the first successful fetch
+        except requests.exceptions.RequestException:
+            continue # Try the next URL if one fails
 
-            if res.status_code != 200 or "text/html" not in res.headers.get("Content-Type", ""):
-                continue
+    if not res:
+        return "ERROR_FETCH_FAILED: Could not access the website after trying several pages."
 
-            soup = BeautifulSoup(res.text, 'html.parser')
+    content_pool = []
+    
+    # Process the successfully fetched page
+    try:
+        soup = BeautifulSoup(res.text, 'html.parser')
 
-            for script_or_style in soup(["script", "style", "nav", "footer", "header"]):
-                script_or_style.decompose()
-
-            main_content = soup.find('main') or soup.find('article') or soup.find('section')
-            text = main_content.get_text(separator=" ", strip=True) if main_content else soup.get_text(separator=" ", strip=True)
-
-            text = re.sub(r'Home\s*About Us\s*Services\s*Contact Us.*', '', text, flags=re.DOTALL | re.IGNORECASE)
+        # Remove common non-content elements before extracting text
+        for element in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+            element.decompose()
+        
+        # More robust text extraction: get all text from the body
+        body_content = soup.find('body')
+        if body_content:
+            text = body_content.get_text(separator=" ", strip=True)
             text = re.sub(r'(©\s*\d{4}\s*|All Rights Reserved|Privacy Policy|Terms of Service).*', '', text, flags=re.DOTALL | re.IGNORECASE)
-
             cleaned_text = re.sub(r'\s+', ' ', text).strip()
             if len(cleaned_text) > 100:
-                content_pool.append(cleaned_text[:2000])
-
-            if len(visited_urls) <= crawl_limit:
-                new_links = _extract_links_from_page(soup, current_url, max_links=3)
-                for link in new_links:
-                    if link not in visited_urls and urlparse(link).netloc == domain:
-                        urls_to_visit.append(link)
-
-        except requests.exceptions.RequestException as e:
-            # Catch connection errors, DNS errors, timeouts
-            return f"ERROR_FETCH_FAILED:{e}"
-        except Exception:
-            # Catch parsing or other unexpected errors
-            pass
+                content_pool.append(cleaned_text)
+    except Exception:
+        # If parsing fails, we might still have no content.
+        pass
 
     full_cleaned_content = " ".join(content_pool)
-    if len(full_cleaned_content) > 3000:
-        full_cleaned_content = full_cleaned_content[:3000]
+    if len(full_cleaned_content) > 4000: # Increased limit for better context
+        full_cleaned_content = full_cleaned_content[:4000]
 
     return full_cleaned_content if len(full_cleaned_content) > 100 else "ERROR_NO_MEANINGFUL_CONTENT"
 
@@ -595,7 +585,6 @@ def calculate_quality_score(
 
     # 1. Core Relevance (Pinecone + Cross-Encoder)
     score += pine_score * PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION
-    # Scale cross_score from [0,1] to contribute fully to MAX_POINTS after MIN_CONTRIBUTION
     cross_encoder_scaled_contribution = (cross_score - CROSS_ENCODER_MIN_CONTRIBUTION) / (1.0 - CROSS_ENCODER_MIN_CONTRIBUTION) if cross_score >= CROSS_ENCODER_MIN_CONTRIBUTION else 0
     score += max(0.0, cross_encoder_scaled_contribution) * CROSS_ENCODER_MAX_POINTS
 
@@ -604,7 +593,6 @@ def calculate_quality_score(
     if req_skills and techs:
         found_count = 0
         for req_skill in req_skills:
-            # Check for direct keyword match or semantic match
             if any(re.search(r'\b' + re.escape(req_skill.lower()) + r'\b', tech) for tech in techs) or \
                semantic_skill_match(req_skill, techs):
                 found_count += 1
@@ -617,14 +605,12 @@ def calculate_quality_score(
     total_years = float(profile.get("total_years_experience", 0.0))
 
     if relevant_years > 0:
-        # More granular and aggressive scaling for relevant years
         if relevant_years >= 15: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS
-        elif relevant_years >= 10: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.95 # Increased from 0.9
-        elif relevant_years >= 7: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.8  # Increased from 0.75
-        elif relevant_years >= 4: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.65 # Increased from 0.6
-        elif relevant_years >= 1: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.4  # Increased from 0.35
-    elif total_years > 0: # Fallback to total years if relevant is zero/not found
-        # Apply a reduced weight for total years, as it's less specific
+        elif relevant_years >= 10: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.95
+        elif relevant_years >= 7: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.8
+        elif relevant_years >= 4: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.65
+        elif relevant_years >= 1: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.4
+    elif total_years > 0:
         if total_years >= 20: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.8
         elif total_years >= 12: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.7
         elif total_years >= 7: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.6
@@ -636,18 +622,15 @@ def calculate_quality_score(
     # 4. Achievements & Impact (Increased impact)
     achievements = [a for a in profile.get("key_achievements_summary", []) if a]
     if achievements:
-        # Reward more for multiple strong achievements
         score += min(len(achievements) * (ACHIEVEMENT_MAX_POINTS / 3), ACHIEVEMENT_MAX_POINTS)
 
     # 5. Seniority Alignment (Stronger reward)
     seniority_kws_in_query = [sk for sk in ["lead", "senior", "manager", "director", "head", "architect", "principal", "vp", "chief"] if sk in query.lower()]
     if seniority_kws_in_query and profile.get("seniority_indicators"):
-        # Check for direct match of query seniority keywords in extracted titles
         if any(any(kw in s.lower() for kw in seniority_kws_in_query) for s in profile.get("seniority_indicators", [])):
             score += SENIORITY_MAX_POINTS
-        # Also give a smaller bonus if general senior titles are present, even if not explicitly in query
-        elif any(s.lower() for s in profile.get("seniority_indicators", [])): # any senior title
-             score += SENIORITY_MAX_POINTS * 0.5 # Smaller bonus
+        elif any(s.lower() for s in profile.get("seniority_indicators", [])):
+             score += SENIORITY_MAX_POINTS * 0.5
 
     # 6. Problem Solving & Bonuses
     if profile.get("problem_solving_evidence") and "no specific evidence" not in profile.get("problem_solving_evidence", "").lower():
@@ -696,7 +679,6 @@ async def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -
         explanation_prompts_to_run.append((query, evidence, detailed_profile))
 
         meta_skills = m["metadata"].get("skills", [])
-        # Check both fuzzy and semantic for meta match bonus
         matched_fuzzy = any(fuzzy_match(skill, meta_skills) for skill in skills)
         matched_semantic = any(semantic_skill_match(skill, meta_skills) for skill in skills)
         matched_meta = matched_fuzzy or matched_semantic
@@ -796,11 +778,11 @@ async def run_analysis_and_search():
         
         if processed_content.startswith("ERROR_FETCH_FAILED"):
             st.session_state.error_message = f"❌ The provided URL is invalid or unreachable: {processed_content.split(':', 1)[1].strip()}. Please correct the URL and try again."
-            return # Stop processing
+            st.session_state.use_manual_sector = True
         elif processed_content == "ERROR_NO_MEANINGFUL_CONTENT":
             st.session_state.warning_message = "⚠️ Could not extract enough meaningful content from the website. Please manually define the sector below."
-            st.session_state.use_manual_sector = True # Auto-select
-            st.session_state.processed_about_text = "" # Clear for next steps
+            st.session_state.use_manual_sector = True
+            st.session_state.processed_about_text = ""
         else:
             st.session_state.processed_about_text = processed_content
             with st.expander("View Processed Website Content"):
@@ -817,9 +799,12 @@ async def run_analysis_and_search():
                 st.session_state.warning_message = "⚠️ Sector inference confidence is low or no specific sector was found. Consider overriding."
                 if st.session_state.inferred_sector_info.get("rationale"):
                     st.info(f"**Reason for low confidence:** {st.session_state.inferred_sector_info['rationale']}")
-                st.session_state.use_manual_sector = True # Auto-select
+                st.session_state.use_manual_sector = True
             else:
-                st.session_state.use_manual_sector = False # Don't show by default
+                st.session_state.use_manual_sector = False
+
+        if st.session_state.error_message:
+             st.error(st.session_state.error_message)
 
         current_company_desc_for_query = st.session_state.inferred_sector_info.get("description", "")
         if st.session_state.use_manual_sector:
@@ -827,23 +812,20 @@ async def run_analysis_and_search():
             if manual_input:
                 st.session_state.manual_sector_input = manual_input
                 current_sector_for_filter = [s.strip() for s in st.session_state.manual_sector_input.split(',')]
-                # Override inferred info for query generation if manual is provided
                 st.session_state.inferred_sector_info["sector"] = current_sector_for_filter
                 st.session_state.inferred_sector_info["description"] = f"Manually provided sector: {st.session_state.manual_sector_input}"
-                st.session_state.inferred_sector_info["confidence"] = 1.0 # Boost confidence
+                st.session_state.inferred_sector_info["confidence"] = 1.0
             else:
-                # If manual override is selected but no input, use inferred (even if low confidence) or empty
                 current_sector_for_filter = st.session_state.inferred_sector_info.get("sector", [])
-        else: # Use inferred if not overriding
+        else:
             current_sector_for_filter = st.session_state.inferred_sector_info.get("sector", [])
         
-        # If there's content to search with (either inferred or manually provided)
         if st.session_state.processed_about_text or current_sector_for_filter:
             proceed_to_search = True
 
     else: # Not a domain, treat as direct text input for sector inference
         st.markdown("### 📝 Text Input Analysis")
-        st.session_state.processed_about_text = user_input # User input is the content
+        st.session_state.processed_about_text = user_input
         
         with st.spinner("Inferring company sector from text input..."):
             st.session_state.inferred_sector_info = await infer_sector_from_text(st.session_state.processed_about_text)
@@ -853,21 +835,21 @@ async def run_analysis_and_search():
 
         if not st.session_state.inferred_sector_info.get("sector") or \
            st.session_state.inferred_sector_info.get("confidence", 0.0) < LLM_SECTOR_CONFIDENCE_THRESHOLD:
-            st.session_state.warning_message = "⚠️ Sector inference confidence is low or no specific sector was found. The search will NOT be filtered by sector by default. Consider manually defining the sector if you intended a sector-specific search."
-            st.session_state.use_manual_sector = st.checkbox("Enter sector manually?", value=True, key="manual_sector_text_input_checkbox") # Auto-select but allow unchecking
+            st.session_state.warning_message = "⚠️ Sector inference confidence is low. Search will NOT be filtered by sector. Consider defining the sector manually."
+            st.session_state.use_manual_sector = st.checkbox("Enter sector manually?", value=True, key="manual_sector_text_input_checkbox")
             if st.session_state.use_manual_sector:
                 manual_input = st.text_input("Enter the correct sector(s) (comma-separated):", value=st.session_state.manual_sector_input, key="manual_sector_text")
                 if manual_input:
                     st.session_state.manual_sector_input = manual_input
                     current_sector_for_filter = [s.strip() for s in st.session_state.manual_sector_input.split(',')]
-                    st.session_state.inferred_sector_info["sector"] = current_sector_for_filter # Update for query generation
+                    st.session_state.inferred_sector_info["sector"] = current_sector_for_filter
                     st.session_state.inferred_sector_info["description"] = f"Manually provided sector: {st.session_state.manual_sector_input}"
-                    st.session_state.inferred_sector_info["confidence"] = 1.0 # Boost confidence
-                else: # Manual override chosen but no input given, so no sector filter applied
+                    st.session_state.inferred_sector_info["confidence"] = 1.0
+                else:
                     current_sector_for_filter = []
-            else: # Manual override not chosen, and inferred confidence is low, so no sector filter
+            else:
                 current_sector_for_filter = []
-        else: # High confidence sector inferred from text input
+        else:
             current_sector_for_filter = st.session_state.inferred_sector_info.get("sector", [])
             st.session_state.use_manual_sector = st.checkbox("Override with manual sector input? (Advanced)", value=False, key="manual_sector_text_high_conf_checkbox")
             if st.session_state.use_manual_sector:
@@ -875,21 +857,17 @@ async def run_analysis_and_search():
                  if manual_input:
                     st.session_state.manual_sector_input = manual_input
                     current_sector_for_filter = [s.strip() for s in st.session_state.manual_sector_input.split(',')]
-                    st.session_state.inferred_sector_info["sector"] = current_sector_for_filter # Update for query generation
+                    st.session_state.inferred_sector_info["sector"] = current_sector_for_filter
                     st.session_state.inferred_sector_info["description"] = f"Manually provided sector: {st.session_state.manual_sector_input}"
-                    st.session_state.inferred_sector_info["confidence"] = 1.0 # Boost confidence
+                    st.session_state.inferred_sector_info["confidence"] = 1.0
         
         current_company_desc_for_query = st.session_state.inferred_sector_info.get("description", "")
-        proceed_to_search = True # Always proceed for text input if no critical errors
+        proceed_to_search = True
 
-    if st.session_state.error_message:
-        st.error(st.session_state.error_message)
-        return
-
-    if st.session_state.warning_message:
+    if st.session_state.warning_message and not st.session_state.error_message:
         st.warning(st.session_state.warning_message)
-
-    if proceed_to_search:
+    
+    if proceed_to_search and not st.session_state.error_message:
         st.markdown("---")
         st.markdown("## 🔍 Search & Match")
 
@@ -917,9 +895,8 @@ async def run_analysis_and_search():
             try:
                 base_filter = {"tier": {"$eq": "A"}}
                 
-                # Apply sector filter only if specific sectors are determined and confidence is high OR manually overridden
                 if current_sector_for_filter and \
-                   (st.session_state.inferred_sector_info.get("confidence", 0.0) >= LLM_SECTOR_CONFIDENCE_THRESHOLD or st.session_state.use_manual_sector):
+                   (st.session_state.inferred_sector_info.get("confidence", 0.0) >= LLM_SECTOR_CONFIDENCE_THRESHOLD or (st.session_state.use_manual_sector and st.session_state.manual_sector_input)):
                     base_filter["sectors"] = {"$in": current_sector_for_filter}
                     st.markdown(f"**Filtering by sector(s):** `{', '.join(current_sector_for_filter)}`")
                 else:
@@ -934,7 +911,6 @@ async def run_analysis_and_search():
 
                 matches = resp.get("matches", [])
                 for m in matches:
-                    # Normalizing Pinecone score from [-1, 1] to [0, 1]
                     m["score"] = max(0.0, min((m.get("score", 0.0) + 1) / 2, 1.0))
 
             except Exception as e:
@@ -974,6 +950,5 @@ async def run_analysis_and_search():
                 st.markdown("---")
 
 
-# Run the main analysis and search logic when user input changes or app is run
 if user_input:
     asyncio.run(run_analysis_and_search())

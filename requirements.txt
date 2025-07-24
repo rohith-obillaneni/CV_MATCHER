@@ -9,3 +9,5 @@ beautifulsoup4
 requests
 numpy
 pinecone
+playwright
+cloudscraper
