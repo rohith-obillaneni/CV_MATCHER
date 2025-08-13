@@ -6,16 +6,17 @@ import streamlit as st
 import numpy as np
 import pinecone
 import requests
-import cloudscraper # Essential for robust fetching
+import cloudscraper
 import asyncio
 from sentence_transformers import SentenceTransformer, CrossEncoder, util, models
-from scipy.special import expit # For sigmoid activation on cross-encoder scores
+from scipy.special import expit
 from dotenv import load_dotenv
 from functools import lru_cache
 from difflib import SequenceMatcher
 from bs4 import BeautifulSoup
 from openai import AsyncOpenAI
 from urllib.parse import urljoin, urlparse
+from typing import List, Dict, Any
 
 # ─────────────────────────────────────────────────
 # CONFIGURATION & HYPERPARAMETERS
@@ -25,20 +26,20 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 PINECONE_ENV = "us-east-1"
 PINECONE_INDEX = "head-of-ai"
-TOP_K = 10
+TOP_K = 15
 
-# --- SCORING WEIGHTS RE-CALIBRATED FOR HIGHER, MORE ACCURATE SCORES ---
-PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION = 0.25
-CROSS_ENCODER_MAX_POINTS = 2.50
-SKILL_COVERAGE_MAX_POINTS = 3.0
-RELEVANT_EXPERIENCE_MAX_POINTS = 4.0
-ACHIEVEMENT_MAX_POINTS = 2.5
-SENIORITY_MAX_POINTS = 1.25
-PROBLEM_SOLVING_MAX_POINTS = 1.25
-METADATA_SKILL_BONUS = 0.35
-EVIDENCE_SOURCE_BONUS_QUERY = 0.15
+# --- SCORING WEIGHTS: RECALIBRATED FOR SECTOR SPECIFICITY AND NUANCE ---
+PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION = 1.0  
+CROSS_ENCODER_MAX_POINTS = 2.0  
+SKILL_COVERAGE_MAX_POINTS = 1.5  
+RELEVANT_EXPERIENCE_MAX_POINTS = 2.5 
+SECTOR_ALIGNMENT_MAX_POINTS = 2.5 
+ACHIEVEMENT_MAX_POINTS = 0.5  
+SENIORITY_MAX_POINTS = 0.5 
+PROBLEM_SOLVING_MAX_POINTS = 0.5 
+EVIDENCE_SOURCE_BONUS_QUERY = 0.25
 EVIDENCE_SOURCE_BONUS_SKILLS = 0.1
-EVIDENCE_SOURCE_PENALTY_NONE = -0.1
+EVIDENCE_SOURCE_PENALTY_NONE = -0.5
 
 CROSS_ENCODER_MIN_CONTRIBUTION = 0.4
 MIN_SIM_THRESHOLD = 0.55
@@ -52,13 +53,18 @@ index = pc.Index(PINECONE_INDEX)
 openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
 # Ensure NLTK data is available
-import nltk
-nltk.data.path.append("nltk_data")
-from nltk.tokenize import sent_tokenize
+try:
+    import nltk
+    nltk.data.path.append("nltk_data")
+    from nltk.tokenize import sent_tokenize
+except ImportError:
+    st.error("NLTK is not installed. Please install it with `pip install nltk`.")
+    st.stop()
 
 
 @st.cache_resource
 def load_models():
+    """Loads the Sentence-BERT and Cross-Encoder models with caching."""
     cross_encoder = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-12-v2", device="cpu")
     transformer = models.Transformer("BAAI/bge-large-en-v1.5")
     pooling = models.Pooling(transformer.get_word_embedding_dimension())
@@ -71,19 +77,19 @@ cross_encoder, embedder = load_models()
 # ─────────────────────────────────────────────────
 # DOMAIN DETECTION + SECTOR INFERENCE
 # ─────────────────────────────────────────────────
-def is_probable_domain(text):
+def is_probable_domain(text: str) -> bool:
     """Checks if the input text likely contains a domain."""
     match = re.search(r"(https?://)?([a-zA-Z0-9.-]+\.[a-z]{2,})(/[\S]*)?", text)
     return bool(match)
 
-def extract_domain(text):
+def extract_domain(text: str) -> str:
     """Extracts the domain from a URL or text."""
     match = re.search(r"(https?://)?([a-zA-Z0-9.-]+\.[a-z]{2,})(/[\S]*)?", text)
     if match:
         return match.group(2).lower()
     return ""
 
-def _extract_links_from_page(soup, base_url, max_links=10):
+def _extract_links_from_page(soup: BeautifulSoup, base_url: str, max_links: int = 10) -> List[str]:
     """Extracts internal links from a BeautifulSoup object, prioritizing navigation."""
     links = set()
     parsed_base_url = urlparse(base_url)
@@ -106,11 +112,12 @@ def _extract_links_from_page(soup, base_url, max_links=10):
 async def fetch_and_process_website_content(domain: str) -> str:
     """
     Fetches and processes website content with a robust, multi-step approach.
+    Now more resilient to redirects and anti-bot measures.
     """
     domain = domain.strip().lower().replace("https://", "").replace("http://", "").split("/")[0]
-    
-    # Heuristic: Try the /about page first, as it's often content-rich, then fall back to the root.
+
     urls_to_try = [
+        f"https://{domain}/about-us",
         f"https://{domain}/about",
         f"https://{domain}/"
     ]
@@ -119,49 +126,44 @@ async def fetch_and_process_website_content(domain: str) -> str:
     res = None
     fetched_url = ""
 
-    # Try to fetch from the list of potential URLs
     for url in urls_to_try:
         try:
             response = scraper.get(url, timeout=15)
             if response.status_code == 200 and "text/html" in response.headers.get("Content-Type", ""):
                 res = response
-                fetched_url = url
-                break # Stop on the first successful fetch
+                fetched_url = response.url
+                break
         except requests.exceptions.RequestException:
-            continue # Try the next URL if one fails
+            continue
 
     if not res:
         return "ERROR_FETCH_FAILED: Could not access the website after trying several pages."
 
     content_pool = []
-    
-    # Process the successfully fetched page
+
     try:
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # Remove common non-content elements before extracting text
-        for element in soup(["script", "style", "nav", "footer", "header", "aside", "form"]):
+        for element in soup(["script", "style", "nav", "footer", "header", "aside", "form", "meta", "link"]):
             element.decompose()
-        
-        # More robust text extraction: get all text from the body
+
         body_content = soup.find('body')
         if body_content:
             text = body_content.get_text(separator=" ", strip=True)
             text = re.sub(r'(©\s*\d{4}\s*|All Rights Reserved|Privacy Policy|Terms of Service).*', '', text, flags=re.DOTALL | re.IGNORECASE)
             cleaned_text = re.sub(r'\s+', ' ', text).strip()
-            if len(cleaned_text) > 100:
+            if len(cleaned_text) > 50:
                 content_pool.append(cleaned_text)
     except Exception:
-        # If parsing fails, we might still have no content.
         pass
 
     full_cleaned_content = " ".join(content_pool)
-    if len(full_cleaned_content) > 4000: # Increased limit for better context
+    if len(full_cleaned_content) > 4000:
         full_cleaned_content = full_cleaned_content[:4000]
 
-    return full_cleaned_content if len(full_cleaned_content) > 100 else "ERROR_NO_MEANINGFUL_CONTENT"
+    return full_cleaned_content if len(full_cleaned_content) > 50 else "ERROR_INSUFFICIENT_CONTENT"
 
-async def infer_sector_from_text(text_content: str) -> dict:
+async def infer_sector_from_text(text_content: str) -> Dict[str, Any]:
     ALLOWED_SECTORS = [
         "Marketing Agency", "Market Research", "FinTech", "Retail", "HealthTech", "EdTech", "LegalTech",
         "SaaS", "Consulting", "AI", "Telecommunications", "Logistics", "Cybersecurity",
@@ -170,20 +172,17 @@ async def infer_sector_from_text(text_content: str) -> dict:
         "Agriculture", "Mining", "Construction", "Education", "Healthcare", "Government",
         "Property Management", "Facilities Management", "Utilities", "Infrastructure Development",
         "Environmental Services", "Waste Management", "Security Services",
-        "Professional Services",
-        "Staffing & Recruitment"
+        "Professional Services", "Staffing & Recruitment", "E-commerce"
     ]
 
-    # Heuristic: If text_content is an exact or very close match to an ALLOWED_SECTOR,
-    # then return it with high confidence immediately.
     text_content_lower = text_content.strip().lower()
     for allowed_sector in ALLOWED_SECTORS:
         if text_content_lower == allowed_sector.lower() or \
-           SequenceMatcher(None, text_content_lower, allowed_sector.lower()).ratio() > 0.95: # Allow slight variations
+           SequenceMatcher(None, text_content_lower, allowed_sector.lower()).ratio() > 0.95:
             return {
                 "sector": [allowed_sector],
                 "description": f"Directly matched user input to sector: {allowed_sector}.",
-                "confidence": 0.99, # Very high confidence
+                "confidence": 0.99,
                 "rationale": ""
             }
 
@@ -195,7 +194,7 @@ You are an expert business analyst. Your task is to precisely classify a company
 
 **Follow these steps:**
 1.  **Analyze Core Function:** First, read the text and determine the company's primary business model. What do they *actually do or sell*? (e.g., "They provide consulting services," "They build and sell software," "They operate an e-commerce platform").
-2.  **Select Specific Sectors:** Based on this core function, select up to two of the most specific, applicable sectors from the ALLOWED_SECTORS list. For example, a company providing outsourced financial experts is better classified as "Professional Services" or "Consulting" within the "Finance" domain, rather than just "Finance".
+2.  **Select Specific Sectors:** Based on this core function, select up to two of the most specific, applicable sectors from the ALLOWED_SECTORS list. For example, a company providing outsourced financial experts is better classified as "Professional Services" or "Consulting" within the "Finance" domain, rather than just "Finance". **Crucially, if a company sells products related to a specific industry (e.g., medical devices, educational software), it's important to include both the business model (e.g., E-commerce, SaaS) and the product industry (e.g., Healthcare, EdTech).**
 3.  **Generate Output:** Create a JSON object with your findings.
 
 **ALLOWED SECTORS:**
@@ -218,6 +217,11 @@ You are an expert business analyst. Your task is to precisely classify a company
 -   **Text:** "We offer fractional CFOs to help startups scale."
 -   **Analysis:** The core function is providing expert services.
 -   **Output:** {{"sector": ["Consulting", "Finance"], "description": "Provides fractional CFO services to businesses.", "confidence": 0.95, "rationale": ""}}
+
+**Example:**
+-   **Text:** "We sell sustainable sonic toothbrushes and related accessories online."
+-   **Analysis:** The core function is selling products online, and the product category is related to dental/healthcare.
+-   **Output:** {{"sector": ["E-commerce", "Healthcare"], "description": "Sells sustainable sonic toothbrushes and related accessories online.", "confidence": 0.95, "rationale": ""}}
 
 **TEXT CONTENT TO ANALYZE:**
 \"\"\"{text_content.strip()}\"\"\"
@@ -249,10 +253,73 @@ You are an expert business analyst. Your task is to precisely classify a company
         }
     except Exception:
         return {"sector": [], "description": "Error during GPT-based classification.", "confidence": 0.0, "rationale": "An exception occurred."}
-
 # ─────────────────────────────────────────────────
 # QUERY + SKILL EXTRACTION
 # ─────────────────────────────────────────────────
+def clean_query(q: str) -> str:
+    """Cleans the query by removing generic terms and extra spaces."""
+    q = re.sub(r"\b(professionals?|candidates?|individuals?|leaders?|background(?: in)?|experience(?: in)?|qualifications?|competencies?|seeking|looking for)\b", "", q, flags=re.I)
+    q = re.sub(r"[\"'“”‘’,.]+", "", q)
+    return re.sub(r'\s+', ' ', q.strip())
+
+async def generate_query(user_input: str, sector_hint: List[str] = None, company_desc: str = "") -> str:
+    """Generates an optimal search query for the CV database."""
+    sector_hint = [s for s in sector_hint if isinstance(s, str) and s.strip()] if sector_hint else []
+    hints = []
+    if sector_hint:
+        hints.append(f"The company operates in the {', '.join(sector_hint)} sector(s).")
+    if company_desc:
+        hints.append(f"The company's core business is: {company_desc}.")
+    hint_txt = " ".join(hints) if hints else "No specific company context provided."
+
+    prompt = f"""
+You are an expert recruiter. Your goal is to create a highly effective search query for a CV database.
+
+Based on the following user input and company context, generate **ONE concise and specific sentence** that describes the ideal candidate's **required skills, primary responsibilities, and relevant domain expertise**.
+
+Focus on:
+- **Actionable skills/competencies**: (e.g., "strategic planning", "data analysis", "software development", "project management").
+- **Specific technologies/tools**: (e.g., "Python", "AWS", "SQL", "CRM platforms").
+- **Relevant industry domains or business areas**: (e.g., "FinTech operations", "healthcare consulting", "supply chain optimization").
+- **Impacts or outcomes**: (e.g., "driving innovation", "improving efficiency", "managing complex projects").
+
+**Crucially, use the company context to make the skills and domains as specific as possible, referencing specific products or services if mentioned.** For example, if the company sells sustainable toothbrushes, mention "e-commerce," "consumer goods," "product marketing," or "dental care products" instead of generic terms like "CRM platforms" unless explicitly requested.
+
+Exclude:
+- Generic adjectives (e.g., "excellent", "strong", "proactive").
+- Vague phrases (e.g., "proven ability", "well-rounded", "great communicator").
+- Redundant information.
+
+Company Context: {hint_txt}
+
+User Input:
+\"\"\"{user_input}\"\"\"
+
+Example:
+User Input: "Looking for someone good at AI and finance for a bank"
+Generated Query: "Candidate requires expertise in artificial intelligence and financial modeling for banking sector operations."
+
+User Input: "Product manager for an EdTech company"
+Generated Query: "Candidate skilled in product lifecycle management, market research, and educational technology product development."
+
+User Input: "best fit for trysuri.com"
+Generated Query: "Candidate requires expertise in e-commerce strategy digital marketing and sustainable product management for online retail of eco-friendly dental care products."
+
+Generated Query:
+"""
+    try:
+        resp = await openai_client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        rewritten = resp.choices[0].message.content.strip()
+        if len(rewritten) < 20 or "ideal candidate" in rewritten.lower():
+            return clean_query(user_input)
+        return clean_query(rewritten)
+    except Exception:
+        return clean_query(user_input)
+        
 async def extract_skills_from_query(query: str) -> list[str]:
     VAGUE_TERMS = {
         "professional background", "experience", "expertise", "background",
@@ -293,64 +360,6 @@ Candidate requirement:
     except Exception:
         return []
 
-def clean_query(q: str) -> str:
-    """Cleans the query by removing generic terms and extra spaces."""
-    q = re.sub(r"\b(professionals?|candidates?|individuals?|leaders?|background(?: in)?|experience(?: in)?|qualifications?|competencies?|seeking|looking for)\b", "", q, flags=re.I)
-    q = re.sub(r"[\"'“”‘’,.]+", "", q)
-    return re.sub(r'\s+', ' ', q.strip())
-
-async def generate_query(user_input: str, sector_hint: list[str] = None, company_desc: str = "") -> str:
-    sector_hint = [s for s in sector_hint if isinstance(s, str) and s.strip()] if sector_hint else []
-    hints = []
-    if sector_hint:
-        hints.append(f"The company operates in the {', '.join(sector_hint)} sector(s).")
-    if company_desc:
-        hints.append(f"The company's core business is: {company_desc}.")
-    hint_txt = " ".join(hints) if hints else "No specific company context provided."
-
-    prompt = f"""
-You are an expert recruiter. Your goal is to create a highly effective search query for a CV database.
-
-Based on the following user input and company context, generate **ONE concise and specific sentence** that describes the ideal candidate's **required skills, primary responsibilities, and relevant domain expertise**.
-
-Focus on:
-- **Actionable skills/competencies**: (e.g., "strategic planning", "data analysis", "software development", "project management").
-- **Specific technologies/tools**: (e.g., "Python", "AWS", "SQL", "CRM platforms").
-- **Relevant industry domains or business areas**: (e.g., "FinTech operations", "healthcare consulting", "supply chain optimization").
-- **Impacts or outcomes**: (e.g., "driving innovation", "improving efficiency", "managing complex projects").
-
-Exclude:
-- Generic adjectives (e.g., "excellent", "strong", "proactive").
-- Vague phrases (e.g., "proven ability", "well-rounded", "great communicator").
-- Redundant information.
-
-Company Context: {hint_txt}
-
-User Input:
-\"\"\"{user_input}\"\"\"
-
-Example:
-User Input: "Looking for someone good at AI and finance for a bank"
-Generated Query: "Candidate requires expertise in artificial intelligence and financial modeling for banking sector operations."
-
-User Input: "Product manager for an EdTech company"
-Generated Query: "Candidate skilled in product lifecycle management, market research, and educational technology product development."
-
-Generated Query:
-"""
-    try:
-        resp = await openai_client.chat.completions.create(
-            model="gpt-4o",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.1
-        )
-        rewritten = resp.choices[0].message.content.strip()
-        if len(rewritten) < 20 or "ideal candidate" in rewritten.lower():
-            return clean_query(user_input)
-        return clean_query(rewritten)
-    except Exception:
-        return clean_query(user_input)
-
 # ─────────────────────────────────────────────────
 # EMBEDDING + EVIDENCE
 # ─────────────────────────────────────────────────
@@ -360,7 +369,7 @@ def get_cached_embedding(text: str):
     return embedder.encode(text, convert_to_tensor=True)
 
 @lru_cache(maxsize=256)
-def get_sentence_embeddings(text):
+def get_sentence_embeddings(text: str):
     """Splits text into sentences and embeds them."""
     sentences = sent_tokenize(re.sub(r'\s+', ' ', text))
     filtered = [s for s in sentences if 30 <= len(s) <= 250 and not s.isupper()]
@@ -371,7 +380,11 @@ def get_sentence_embeddings(text):
     return filtered, embedder.encode(filtered, convert_to_tensor=True)
 
 
-def extract_evidence(query: str, cv_text: str, skills: list[str]) -> tuple[str, str]:
+def extract_evidence(query: str, cv_text: str, skills: List[str], relevant_sectors: List[str]) -> tuple[str, str]:
+    """
+    Extracts the most relevant sentences from a CV to serve as evidence, prioritizing
+    sector-specific content and quantifiable impacts.
+    """
     sentences, sent_embs = get_sentence_embeddings(cv_text)
     if not sentences or sent_embs is None:
         fallback_text = cv_text.strip()
@@ -381,24 +394,52 @@ def extract_evidence(query: str, cv_text: str, skills: list[str]) -> tuple[str, 
             return f"No direct sentence evidence found. General CV preview:\n• {fallback_text}...", "none_partial"
         return "No meaningful content found in CV for evidence.", "none_empty"
 
-    query_emb = embedder.encode(query, convert_to_tensor=True)
+    query_emb = get_cached_embedding(query)
     scores = util.cos_sim(query_emb, sent_embs)[0].cpu().numpy().tolist()
 
     candidates = [(sc, s) for sc, s in zip(scores, sentences) if sc >= 0.45]
-    if candidates:
-        source = "query"
-        top = sorted(candidates, key=lambda x: x[0], reverse=True)
-        deduped = []
-        seen_phrases = set()
-        for _, s in top:
-            if s not in seen_phrases and all(SequenceMatcher(None, s, existing_s).ratio() < 0.9 for existing_s in seen_phrases):
-                deduped.append(s)
-                seen_phrases.add(s)
-            if len(deduped) >= MAX_EVIDENCE:
-                break
-        bullets = [f"• {s if s.endswith('.') else s + '.'}" for s in deduped]
-        return "\n".join(bullets), source
+    
+    if relevant_sectors:
+        sector_keywords = {kw.lower() for s in relevant_sectors for kw in re.findall(r'\b\w+\b', s)}
+        for i, (score, sentence) in enumerate(candidates):
+            if any(kw in sentence.lower() for kw in sector_keywords):
+                candidates[i] = (score * 1.2, sentence)
 
+    quantifiable_achievements = [s for sc, s in candidates if re.search(r'\b(\d+%|\$\d+|£\d+|\d+M|\d+B|\d+K)\b', s, re.IGNORECASE)]
+    
+    selected_evidence = []
+    
+    # Priority 1: Quantifiable achievements with sector alignment
+    if relevant_sectors:
+        for sent in quantifiable_achievements:
+            if any(s.lower() in sent.lower() for s in relevant_sectors):
+                selected_evidence.append(sent)
+                if len(selected_evidence) >= MAX_EVIDENCE:
+                    break
+    
+    # Priority 2: General quantifiable achievements
+    if len(selected_evidence) < MAX_EVIDENCE and quantifiable_achievements:
+        remaining_to_add = MAX_EVIDENCE - len(selected_evidence)
+        for sent in quantifiable_achievements:
+            if sent not in selected_evidence:
+                selected_evidence.append(sent)
+                if len(selected_evidence) >= MAX_EVIDENCE:
+                    break
+    
+    # Priority 3: Top semantic matches
+    if len(selected_evidence) < MAX_EVIDENCE:
+        top_semantic = sorted(candidates, key=lambda x: x[0], reverse=True)
+        for _, sent in top_semantic:
+            if sent not in selected_evidence:
+                selected_evidence.append(sent)
+                if len(selected_evidence) >= MAX_EVIDENCE:
+                    break
+
+    if selected_evidence:
+        source = "query"
+        bullets = [f"• {s if s.endswith('.') else s + '.'}" for s in selected_evidence]
+        return "\n".join(bullets), source
+    
     skill_matches = []
     for skill in skills:
         keywords = re.findall(r'\w+', skill.lower())
@@ -426,23 +467,29 @@ def extract_evidence(query: str, cv_text: str, skills: list[str]) -> tuple[str, 
         return f"No specific evidence found. General CV preview:\n• {fallback_text}...", "none_partial"
     return "No meaningful content found in CV for evidence.", "none_empty"
 
-async def extract_detailed_candidate_profile(client, cv_text: str, required_skills: list[str]) -> dict:
-    cv_text_truncated = cv_text[:5000]
 
+async def extract_detailed_candidate_profile(client, cv_text: str, required_skills: List[str], relevant_sectors: List[str]) -> Dict[str, Any]:
+    """
+    Extracts structured data from a CV using an LLM, with a focus on linking achievements to companies
+    and accurately calculating relevant experience based on sectors.
+    """
+    
     prompt = f"""
 You are a meticulous and literal HR data extraction engine. Your task is to parse the provided CV text and extract specific data points into a structured JSON format. **Adhere STRICTLY to the instructions. Do not invent or assume, but you may infer if the context strongly implies information not explicitly stated.**
 
 **Required Skills for Context:** {', '.join(required_skills) if required_skills else "General relevant skills"}
+**Relevant Sectors:** {', '.join(relevant_sectors) if relevant_sectors else "No specific sectors given."}
 
 **Candidate CV Text:**
-\"\"\"{cv_text_truncated}\"\"\"
+\"\"\"{cv_text}\"\"\"
 
 **JSON EXTRACTION INSTRUCTIONS:**
 {{
     "total_years_experience": "Calculate the total professional work experience in years. Sum the durations of all listed roles (e.g., '2015 – 2020' is 5 years, 'Jan 2020 - Jun 2022' is 2.5 years). If start/end dates are not present for all roles, estimate conservatively from the earliest to latest date mentioned. Provide a single number (e.g., 12.5). If not possible to determine, return 0.0.",
-    "relevant_experience_years": "Calculate the total years of experience from roles where the responsibilities are **strongly aligned or directly related** to the **Required Skills for Context** or the overall domain/sector implied by the skills. Sum the durations for only these relevant roles. If a role from 2010-2020 is only 50% relevant, count it as 5 years. Conservatively estimate if precise dates or explicit relevance percentages are not available. Return a single number (e.g., 8.0). If no roles are relevant, return 0.0.",
-    "key_achievements_summary": [
-        "Extract 2-3 of the most impactful, QUANTIFIABLE achievements from the CV. These should be direct quotes or tight summaries containing numbers, percentages, or clear business outcomes (e.g., 'Managed a $5M budget', 'Increased user engagement by 25%'). Prioritize quantifiable results. If no such achievements are found, return an empty list []."
+    "relevant_experience_years": "Calculate the total years of experience from roles where the responsibilities are **strongly aligned or directly related** to the **Required Skills for Context** or the **Relevant Sectors**. For example, if a company is in the 'Energy' sector and the candidate worked for an energy company from 2010-2020, that's 10 years of relevant experience. If a role from 2010-2020 is only 50% relevant, count it as 5 years. Conservatively estimate if precise dates or explicit relevance percentages are not available. Return a single number (e.g., 8.0). If no roles are relevant, return 0.0.",
+    "relevant_experience_rationale": "Provide a brief, specific rationale for the relevant_experience_years calculation. For example: '5 years at PCL Health in the healthcare sector, and 3 years at Just Eat in eCommerce.'"
+    "key_achievements_with_company": [
+        "Extract 2-3 of the most impactful, QUANTIFIABLE achievements from the CV. These should be direct quotes or tight summaries containing numbers, percentages, or clear business outcomes (e.g., 'Increased user engagement by 25%'). For each achievement, you MUST also identify the company name it was associated with from the CV text. If no such achievements are found, return an empty list []. Format as 'Achievement (at Company Name)'. If the company name cannot be found, just return the achievement."
     ],
     "seniority_indicators": [
         "STRICTLY extract the specific job titles from the CV text that denote seniority (e.g., 'Senior Product Manager', 'Chief Technology Officer', 'Head of Analytics', 'Director', 'VP'). DO NOT list generic keywords like 'Lead' or 'Manager' unless they are part of an actual senior title in the text. If no senior titles are found, return an empty list []."
@@ -463,80 +510,124 @@ You are a meticulous and literal HR data extraction engine. Your task is to pars
         content = response.choices[0].message.content
         parsed_profile = json.loads(content)
 
-        # --- Robust Post-processing ---
-        for key in ["key_achievements_summary", "seniority_indicators", "technologies_used"]:
+        for key in ["key_achievements_with_company", "seniority_indicators", "technologies_used"]:
             if not isinstance(parsed_profile.get(key), list):
                 parsed_profile[key] = []
-            else: # Clean up empty strings or non-strings from lists
+            else:
                 parsed_profile[key] = [item for item in parsed_profile[key] if isinstance(item, str) and item.strip()]
-
 
         for key in ["total_years_experience", "relevant_experience_years"]:
             val = parsed_profile.get(key, 0)
             if not isinstance(val, (int, float)):
-                # Attempt to extract number if model fails to return a clean one
                 num_search = re.search(r'\d+\.?\d*', str(val))
                 parsed_profile[key] = float(num_search.group()) if num_search else 0.0
             else:
-                 parsed_profile[key] = float(val) # Ensure float for consistency
-
+                 parsed_profile[key] = float(val)
 
         if not isinstance(parsed_profile.get("problem_solving_evidence"), str) or not parsed_profile.get("problem_solving_evidence").strip() or "no specific evidence" in parsed_profile.get("problem_solving_evidence", "").lower():
              parsed_profile["problem_solving_evidence"] = "No specific evidence found."
 
+        if not isinstance(parsed_profile.get("relevant_experience_rationale"), str):
+            parsed_profile["relevant_experience_rationale"] = "No rationale provided."
+
+
         return parsed_profile
     except Exception:
-        # Fallback for any parsing or API error
         return {
             "total_years_experience": 0.0,
             "relevant_experience_years": 0.0,
-            "key_achievements_summary": [],
+            "relevant_experience_rationale": "Extraction failed.",
+            "key_achievements_with_company": [],
             "seniority_indicators": [],
             "technologies_used": [],
             "problem_solving_evidence": "No specific evidence found."
         }
 
-
 # ─────────────────────────────────────────────────
 # SCORING, LOGGING & UI
 # ─────────────────────────────────────────────────
-def fuzzy_match(skill: str, meta_skills: list[str]) -> bool:
+def fuzzy_match(skill: str, meta_skills: List[str]) -> bool:
     """Performs a fuzzy match between a skill and a list of metadata skills."""
     return any(SequenceMatcher(None, skill.lower(), ms.lower()).ratio() > FUZZY_THRESHOLD for ms in meta_skills)
 
-async def explain_match_gpt_async(client, query: str, evidence: str, detailed_profile: dict) -> str:
-    achievements_text = "\n".join([f"- {item}" for item in detailed_profile.get("key_achievements_summary", []) if item]) or "None specified."
+def calculate_sector_alignment_score(cv_text: str, relevant_sectors: List[str]) -> float:
+    """
+    Calculates a score based on how directly the CV text aligns with the relevant sectors.
+    """
+    if not relevant_sectors or not cv_text:
+        return 0.0
+    
+    score = 0.0
+    
+    sector_keywords = {kw.lower() for s in relevant_sectors for kw in re.findall(r'\b\w+\b', s)}
+    
+    sector_related_sentences = [
+        s for s in sent_tokenize(cv_text) if any(kw in s.lower() for kw in sector_keywords)
+    ]
+    
+    if not sector_related_sentences:
+        return 0.0
+        
+    for sentence in sector_related_sentences:
+        if re.search(r'\b(\d+%|\$\d+|£\d+|\d+M|\d+B|\d+K)\b', sentence, re.IGNORECASE):
+            score += 1.0
+            
+    for sentence in sector_related_sentences:
+        if any(s.lower() in sentence.lower() for s in relevant_sectors):
+            score += 0.5
+
+    score += len(sector_related_sentences) * 0.1
+    
+    return min(score, SECTOR_ALIGNMENT_MAX_POINTS)
+
+
+async def explain_match_gpt_async(client, query: str, evidence: str, detailed_profile: Dict, score_label: str, relevant_sectors: List[str]) -> str:
+    """
+    Generates a factual, evidence-based explanation for a candidate's fit,
+    now with a strong focus on direct, sector-relevant experience.
+    """
+    achievements_text = "\n".join([f"- {item}" for item in detailed_profile.get("key_achievements_with_company", []) if item]) or "None specified."
     seniority_text = ", ".join([item for item in detailed_profile.get("seniority_indicators", []) if item]) or "None specified."
     technologies_text = ", ".join([item for item in detailed_profile.get("technologies_used", []) if item]) or "None specified."
     problem_solving_text = detailed_profile.get('problem_solving_evidence', 'No specific evidence found.')
+    relevant_years = detailed_profile.get('relevant_experience_years', 0.0)
+    name = detailed_profile.get('name', 'The candidate')
 
     prompt = f"""
-You are a fair and neutral hiring analyst.
-
-Based on the REQUIREMENT sentence, the provided EVIDENCE, and the CANDIDATE PROFILE details:
+You are a hiring analyst whose goal is to provide a positive, evidence-based summary of a candidate's fit for a role. Your explanation should focus on the candidate's strengths and how their experience, skills, and achievements align with the job requirements.
 
 **REQUIREMENT:** "{query}"
 
-**EVIDENCE (Directly from CV):**
-{evidence}
-
-**CANDIDATE PROFILE HIGHLIGHTS:**
-- Total Years Experience: {detailed_profile.get('total_years_experience', 'N/A')} years
-- Relevant Experience Years: {detailed_profile.get('relevant_experience_years', 'N/A')} years
+**CANDIDATE'S STRENGTHS & EVIDENCE (from CV):**
+- Relevant Experience Years: {relevant_years} years
 - Key Achievements:
 {achievements_text}
 - Seniority Indicators: {seniority_text}
 - Technologies Used: {technologies_text}
 - Problem-Solving Evidence: {problem_solving_text}
+- Raw Evidence:
+{evidence}
 
-Your task:
-- Write **3 concise, factual bullet points** explaining why this person fits the requirement.
-- **Strictly use ONLY the provided EVIDENCE and CANDIDATE PROFILE HIGHLIGHTS**. Do NOT invent or assume any information not explicitly shown.
-- Directly address aspects of the REQUIREMENT.
-- Avoid subjective praise like "excellent", "strong", "clearly".
-- Use neutral, objective language.
+**Relevant Sectors:** {', '.join(relevant_sectors)}
 
-Format:
+**Your Task (Strict Instructions):**
+- Write **3 concise, factual bullet points** explaining why this person is a good fit.
+- **You MUST use ONLY the provided "CANDIDATE'S STRENGTHS & EVIDENCE".**
+- **The first bullet point MUST prioritize a sector-relevant achievement, explicitly citing the company name and explaining how it directly relates to the {', '.join(relevant_sectors)} sectors if possible.**
+- **The second bullet point should focus on a key achievement or problem-solving skill, ideally with quantifiable impact.**
+- **The third bullet point can address leadership, seniority, or technical skills.**
+- **DO NOT** mention or highlight any lack of experience, skills, or achievements. Instead, focus on the positive evidence that is present.
+- **Crucially, avoid making logical leaps or tenuous connections.** The explanation must be directly grounded in the provided evidence. For example, if the requirement is "e-commerce for dental products" and an achievement is "increased retail revenue," state that the candidate has retail experience but DO NOT state they have dental product experience unless the evidence explicitly mentions it.
+- Use neutral, professional language.
+- The tone should reflect the candidate's score. A "Strong Fit" explanation should be more confident than a "Weak Fit" explanation.
+
+**Example for a candidate with a direct sector match:**
+- If the requirement is "solar farm development" and the candidate's achievements mention "Led the development of a 50MW solar farm," the first bullet should state this directly.
+
+**Example for a candidate with no direct sector match but strong skills:**
+- If the requirement is "project management" and the candidate's achievements mention "Led a team of 150 data scientists," the explanation should focus on the leadership and team management aspect. It should NOT say "The candidate has no relevant experience in project management..."
+
+**Format:**
 - Bullet 1
 - Bullet 2
 - Bullet 3
@@ -552,16 +643,16 @@ Format:
         return f"Could not generate detailed explanation due to an error: {e}"
 
 
-def semantic_skill_match(skill: str, meta_skills: list[str], threshold: float = 0.7) -> bool:
+def semantic_skill_match(skill: str, meta_skills: List[str], threshold: float = 0.7) -> bool:
     """Performs a semantic similarity check between a skill and a list of metadata skills."""
     if not skill or not meta_skills:
         return False
     try:
-        skill_emb = embedder.encode(skill, convert_to_tensor=True)
+        skill_emb = get_cached_embedding(skill)
         valid_meta_skills = [s for s in meta_skills if isinstance(s, str) and s.strip()]
         if not valid_meta_skills:
             return False
-        
+
         meta_embs = embedder.encode(valid_meta_skills, convert_to_tensor=True)
         sims = util.cos_sim(skill_emb, meta_embs)[0]
         return any(s.item() > threshold for s in sims)
@@ -569,26 +660,42 @@ def semantic_skill_match(skill: str, meta_skills: list[str], threshold: float = 
         return False
 
 def calculate_quality_score(
-    profile: dict,
-    req_skills: list[str],
+    profile: Dict,
+    req_skills: List[str],
     query: str,
     pine_score: float,
     cross_score: float,
     evidence_src: str,
-    meta_match: bool
+    relevant_sectors: List[str],
+    sector_alignment_score: float
 ) -> float:
     """
-    Calculates a comprehensive quality score. This version is recalibrated to
-    better reward experienced candidates and tangible achievements with robust fallbacks.
+    Calculates a comprehensive quality score based on multiple factors.
+    The weights have been re-calibrated to prioritize relevant experience and
+    sector alignment more heavily.
     """
     score = 0.0
 
-    # 1. Core Relevance (Pinecone + Cross-Encoder)
+    # Normalizing Pinecone score and giving it a proper weight
     score += pine_score * PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION
+    
+    # Scaling Cross-Encoder score and giving it a proper weight
     cross_encoder_scaled_contribution = (cross_score - CROSS_ENCODER_MIN_CONTRIBUTION) / (1.0 - CROSS_ENCODER_MIN_CONTRIBUTION) if cross_score >= CROSS_ENCODER_MIN_CONTRIBUTION else 0
     score += max(0.0, cross_encoder_scaled_contribution) * CROSS_ENCODER_MAX_POINTS
-
-    # 2. Skill Coverage (Increased impact)
+    
+    # Sector-specific alignment is now a more balanced factor
+    score += sector_alignment_score
+    
+    relevant_years = float(profile.get("relevant_experience_years", 0.0))
+    if relevant_years >= 5:
+        score += RELEVANT_EXPERIENCE_MAX_POINTS * 1.0 
+    elif relevant_years >= 3:
+        score += RELEVANT_EXPERIENCE_MAX_POINTS * 0.8 
+    elif relevant_years >= 1:
+        score += RELEVANT_EXPERIENCE_MAX_POINTS * 0.5
+    elif relevant_years > 0:
+        score += RELEVANT_EXPERIENCE_MAX_POINTS * 0.25
+    
     techs = [t.lower() for t in profile.get("technologies_used", []) if isinstance(t, str)]
     if req_skills and techs:
         found_count = 0
@@ -599,60 +706,43 @@ def calculate_quality_score(
         skill_coverage_ratio = found_count / len(req_skills) if len(req_skills) > 0 else 0
         score += skill_coverage_ratio * SKILL_COVERAGE_MAX_POINTS
 
-    # 3. Relevant Experience (Heavily weighted with robust fallbacks and better scaling)
-    exp_points = 0.0
-    relevant_years = float(profile.get("relevant_experience_years", 0.0))
-    total_years = float(profile.get("total_years_experience", 0.0))
-
-    if relevant_years > 0:
-        if relevant_years >= 15: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS
-        elif relevant_years >= 10: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.95
-        elif relevant_years >= 7: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.8
-        elif relevant_years >= 4: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.65
-        elif relevant_years >= 1: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.4
-    elif total_years > 0:
-        if total_years >= 20: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.8
-        elif total_years >= 12: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.7
-        elif total_years >= 7: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.6
-        elif total_years >= 4: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.4
-        else: exp_points = RELEVANT_EXPERIENCE_MAX_POINTS * 0.2
-    
-    score += exp_points
-
-    # 4. Achievements & Impact (Increased impact)
-    achievements = [a for a in profile.get("key_achievements_summary", []) if a]
+    achievements = [a for a in profile.get("key_achievements_with_company", []) if a]
     if achievements:
         score += min(len(achievements) * (ACHIEVEMENT_MAX_POINTS / 3), ACHIEVEMENT_MAX_POINTS)
 
-    # 5. Seniority Alignment (Stronger reward)
     seniority_kws_in_query = [sk for sk in ["lead", "senior", "manager", "director", "head", "architect", "principal", "vp", "chief"] if sk in query.lower()]
     if seniority_kws_in_query and profile.get("seniority_indicators"):
         if any(any(kw in s.lower() for kw in seniority_kws_in_query) for s in profile.get("seniority_indicators", [])):
             score += SENIORITY_MAX_POINTS
-        elif any(s.lower() for s in profile.get("seniority_indicators", [])):
-             score += SENIORITY_MAX_POINTS * 0.5
 
-    # 6. Problem Solving & Bonuses
     if profile.get("problem_solving_evidence") and "no specific evidence" not in profile.get("problem_solving_evidence", "").lower():
         score += PROBLEM_SOLVING_MAX_POINTS
-    
-    if meta_match: score += METADATA_SKILL_BONUS
-    
+
     if evidence_src == "query": score += EVIDENCE_SOURCE_BONUS_QUERY
     elif evidence_src == "skills": score += EVIDENCE_SOURCE_BONUS_SKILLS
     elif evidence_src.startswith("none"): score += EVIDENCE_SOURCE_PENALTY_NONE
-    
+
     return round(max(0.0, min(score, 10.0)), 2)
 
-
-async def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -> list[dict]:
+async def rerank_and_score(query: str, matches: List[Dict], skills: List[str], relevant_sectors: List[str]) -> List[Dict]:
+    """
+    Reranks and scores candidates based on a multi-stage process.
+    """
     results_data = []
-    
+
+    unique_matches = {}
+    for m in matches:
+        candidate_id = m.get("id")
+        if candidate_id not in unique_matches or m.get("score", 0) > unique_matches[candidate_id].get("score", 0):
+            unique_matches[candidate_id] = m
+
+    matches = list(unique_matches.values())
+
     cv_texts = [m["metadata"].get("text", "") for m in matches]
-    cross_encoder_pairs = [(query, t[:2000]) for t in cv_texts]
-    
+    cross_encoder_pairs = [(query, t) for t in cv_texts]
+
     profile_extraction_tasks = [
-        extract_detailed_candidate_profile(openai_client, text, skills) for text in cv_texts
+        extract_detailed_candidate_profile(openai_client, text, skills, relevant_sectors) for text in cv_texts
     ]
 
     cross_probs = []
@@ -662,11 +752,11 @@ async def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -
             cross_probs = expit(cross_raw).tolist()
         except Exception:
             cross_probs = [0.0] * len(cross_encoder_pairs)
-    
+
     detailed_profiles_batch = await asyncio.gather(*profile_extraction_tasks)
 
     explanation_prompts_to_run = []
-    
+
     for i, m in enumerate(matches):
         cv_text = cv_texts[i]
         pine_score = m.get("score", 0)
@@ -674,18 +764,15 @@ async def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -
         detailed_profile = detailed_profiles_batch[i]
         detailed_profile['name'] = m["metadata"].get("name", "Unnamed")
 
-        evidence, source = extract_evidence(query, cv_text, skills)
-        
-        explanation_prompts_to_run.append((query, evidence, detailed_profile))
-
-        meta_skills = m["metadata"].get("skills", [])
-        matched_fuzzy = any(fuzzy_match(skill, meta_skills) for skill in skills)
-        matched_semantic = any(semantic_skill_match(skill, meta_skills) for skill in skills)
-        matched_meta = matched_fuzzy or matched_semantic
+        evidence, source = extract_evidence(query, cv_text, skills, relevant_sectors)
+        sector_alignment_score = calculate_sector_alignment_score(cv_text, relevant_sectors)
 
         final_score = calculate_quality_score(
-            detailed_profile, skills, query, pine_score, cross_score, source, matched_meta
+            detailed_profile, skills, query, pine_score, cross_score, source, relevant_sectors, sector_alignment_score
         )
+        
+        score_label_str = score_label(final_score)
+        
         results_data.append({
             "name": m["metadata"].get("name", "Unnamed"),
             "cv_link": m["metadata"].get("cv_link", ""),
@@ -693,26 +780,26 @@ async def rerank_and_score(query: str, matches: list[dict], skills: list[str]) -
             "evidence": evidence,
             "evidence_source": source,
             "detailed_profile": detailed_profile,
-            "explanation_query": (query, evidence, detailed_profile)
+            "explanation_query": (query, evidence, detailed_profile, score_label_str, relevant_sectors)
         })
 
     explanation_tasks = [
         explain_match_gpt_async(openai_client, *r.pop("explanation_query")) for r in results_data
     ]
     explanations_batch = await asyncio.gather(*explanation_tasks)
-    
+
     for i, r in enumerate(results_data):
         r["explanation"] = explanations_batch[i]
         r["score_label"] = score_label(r["score"])
 
-    return sorted(results_data, key=lambda x: x["score"], reverse=True)
+    return (sorted(results_data, key=lambda x: x["score"], reverse=True))[:3]
 
 
-def score_label(score):
+def score_label(score: float) -> str:
     """Assigns a human-readable label to the score."""
-    if score >= 9.0: return "✅ Excellent Match"
-    elif score >= 7.5: return "🟢 Strong Fit"
-    elif score >= 6.0: return "🟡 Moderate Fit"
+    if score >= 8.5: return "✅ Excellent Match"
+    elif score >= 7.0: return "🟢 Strong Fit"
+    elif score >= 5.0: return "🟡 Moderate Fit"
     return "🔴 Weak Fit"
 
 
@@ -722,7 +809,6 @@ def score_label(score):
 st.set_page_config(page_title="CV Matcher", layout="centered")
 st.title("CV Matcher")
 
-# Initialize session state variables for UI control
 if 'manual_sector_input' not in st.session_state:
     st.session_state.manual_sector_input = ""
 if 'use_manual_sector' not in st.session_state:
@@ -775,11 +861,11 @@ async def run_analysis_and_search():
 
         with st.spinner("Fetching and processing website content... This may take a moment."):
             processed_content = await fetch_and_process_website_content(domain)
-        
+
         if processed_content.startswith("ERROR_FETCH_FAILED"):
             st.session_state.error_message = f"❌ The provided URL is invalid or unreachable: {processed_content.split(':', 1)[1].strip()}. Please correct the URL and try again."
             st.session_state.use_manual_sector = True
-        elif processed_content == "ERROR_NO_MEANINGFUL_CONTENT":
+        elif processed_content == "ERROR_INSUFFICIENT_CONTENT":
             st.session_state.warning_message = "⚠️ Could not extract enough meaningful content from the website. Please manually define the sector below."
             st.session_state.use_manual_sector = True
             st.session_state.processed_about_text = ""
@@ -787,7 +873,7 @@ async def run_analysis_and_search():
             st.session_state.processed_about_text = processed_content
             with st.expander("View Processed Website Content"):
                 st.code(st.session_state.processed_about_text)
-            
+
             with st.spinner("Inferring company sector from processed content..."):
                 st.session_state.inferred_sector_info = await infer_sector_from_text(st.session_state.processed_about_text)
 
@@ -819,14 +905,14 @@ async def run_analysis_and_search():
                 current_sector_for_filter = st.session_state.inferred_sector_info.get("sector", [])
         else:
             current_sector_for_filter = st.session_state.inferred_sector_info.get("sector", [])
-        
+
         if st.session_state.processed_about_text or current_sector_for_filter:
             proceed_to_search = True
 
-    else: # Not a domain, treat as direct text input for sector inference
+    else:
         st.markdown("### 📝 Text Input Analysis")
         st.session_state.processed_about_text = user_input
-        
+
         with st.spinner("Inferring company sector from text input..."):
             st.session_state.inferred_sector_info = await infer_sector_from_text(st.session_state.processed_about_text)
 
@@ -860,13 +946,12 @@ async def run_analysis_and_search():
                     st.session_state.inferred_sector_info["sector"] = current_sector_for_filter
                     st.session_state.inferred_sector_info["description"] = f"Manually provided sector: {st.session_state.manual_sector_input}"
                     st.session_state.inferred_sector_info["confidence"] = 1.0
-        
         current_company_desc_for_query = st.session_state.inferred_sector_info.get("description", "")
         proceed_to_search = True
 
     if st.session_state.warning_message and not st.session_state.error_message:
         st.warning(st.session_state.warning_message)
-    
+
     if proceed_to_search and not st.session_state.error_message:
         st.markdown("---")
         st.markdown("## 🔍 Search & Match")
@@ -893,15 +978,15 @@ async def run_analysis_and_search():
 
         with st.spinner("Searching Pinecone database for candidates..."):
             try:
-                base_filter = {"tier": {"$eq": "A"}}
-                
+                base_filter = {}
+
                 if current_sector_for_filter and \
                    (st.session_state.inferred_sector_info.get("confidence", 0.0) >= LLM_SECTOR_CONFIDENCE_THRESHOLD or (st.session_state.use_manual_sector and st.session_state.manual_sector_input)):
                     base_filter["sectors"] = {"$in": current_sector_for_filter}
                     st.markdown(f"**Filtering by sector(s):** `{', '.join(current_sector_for_filter)}`")
                 else:
                     st.warning("⚠️ No reliable sector detected or manually provided — running unfiltered Tier-A match (may be less precise).")
-                
+
                 resp = index.query(
                     vector=q_vec.tolist(),
                     top_k=TOP_K,
@@ -921,10 +1006,9 @@ async def run_analysis_and_search():
             st.warning("No relevant candidates found in the database matching your criteria. Try a different query or adjust sector filters.")
             return
 
-        st.markdown(f"Found {len(matches)} potential candidates. Reranking for accuracy...")
-        st.session_state.search_results_data = await rerank_and_score(st.session_state.search_query, matches, st.session_state.extracted_skills)
+        st.markdown(f"Found {len(matches)} potential candidates. Reranking best 3 for accuracy...")
+        st.session_state.search_results_data = await rerank_and_score(st.session_state.search_query, matches, st.session_state.extracted_skills, current_sector_for_filter)
         st.session_state.display_search_results = True
-
 
     if st.session_state.display_search_results:
         st.markdown("---")
@@ -936,11 +1020,11 @@ async def run_analysis_and_search():
             for i, r in enumerate(st.session_state.search_results_data, 1):
                 st.markdown(f"### Match {i}: {r['name']} — {r['score']}/10  {r['score_label']}")
                 st.write(f"**CV**: [View]({r['cv_link']})")
-                
+
                 with st.container(border=True):
                     st.markdown("**Why This Matches (GPT‑4o):**")
                     st.markdown(r["explanation"])
-                
+
                 with st.expander("Show Extracted Evidence & Details"):
                     st.markdown("**Raw Evidence Extracted:**")
                     st.markdown(r["evidence"])

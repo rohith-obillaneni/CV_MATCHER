@@ -12,3 +12,7 @@ model_cache/
 
 draft.py
 sample.py
+# Elastic Beanstalk Files
+.elasticbeanstalk/*
+!.elasticbeanstalk/*.cfg.yml
+!.elasticbeanstalk/*.global.yml
