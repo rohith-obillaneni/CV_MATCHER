@@ -29,14 +29,14 @@ PINECONE_INDEX = "head-of-ai"
 TOP_K = 15
 
 # --- SCORING WEIGHTS: RECALIBRATED FOR SECTOR SPECIFICITY AND NUANCE ---
-PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION = 1.0  
-CROSS_ENCODER_MAX_POINTS = 2.0  
-SKILL_COVERAGE_MAX_POINTS = 1.5  
-RELEVANT_EXPERIENCE_MAX_POINTS = 2.5 
-SECTOR_ALIGNMENT_MAX_POINTS = 2.5 
-ACHIEVEMENT_MAX_POINTS = 0.5  
-SENIORITY_MAX_POINTS = 0.5 
-PROBLEM_SOLVING_MAX_POINTS = 0.5 
+PINE_WEIGHT_FINAL_SCORE_CONTRIBUTION = 1.0
+CROSS_ENCODER_MAX_POINTS = 2.0
+SKILL_COVERAGE_MAX_POINTS = 1.5
+RELEVANT_EXPERIENCE_MAX_POINTS = 2.5
+SECTOR_ALIGNMENT_MAX_POINTS = 2.5
+ACHIEVEMENT_MAX_POINTS = 0.5
+SENIORITY_MAX_POINTS = 0.5
+PROBLEM_SOLVING_MAX_POINTS = 0.5
 EVIDENCE_SOURCE_BONUS_QUERY = 0.25
 EVIDENCE_SOURCE_BONUS_SKILLS = 0.1
 EVIDENCE_SOURCE_PENALTY_NONE = -0.5
@@ -46,6 +46,7 @@ MIN_SIM_THRESHOLD = 0.55
 MAX_EVIDENCE = 3
 FUZZY_THRESHOLD = 0.85
 LLM_SECTOR_CONFIDENCE_THRESHOLD = 0.7
+COMPANY_DESCRIPTION_LENGTH = 7
 
 openai.api_key = OPENAI_API_KEY
 pc = pinecone.Pinecone(api_key=PINECONE_API_KEY, environment=PINECONE_ENV)
@@ -359,6 +360,39 @@ Candidate requirement:
         return filtered_skills
     except Exception:
         return []
+        
+# NEW: Asynchronously infer the sector of a company from its CV context
+async def infer_company_sector(client, company_name: str, cv_text: str) -> str:
+    """Infers a brief sector description for a company based on CV text."""
+    prompt = f"""
+You are a meticulous data extractor. Based on the provided CV text, infer the industry or sector of the company named '{company_name}'.
+The description should be very brief and concise, no more than {COMPANY_DESCRIPTION_LENGTH} words.
+Example: 'A corporate finance firm', 'A global technology consultancy', 'An e-commerce startup'.
+If you cannot infer the sector, return an empty string.
+
+**Company Name:** {company_name}
+**CV Context:**
+\"\"\"{cv_text}\"\"\"
+
+Brief Sector Description:
+"""
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        description = response.choices[0].message.content.strip()
+        
+        # Post-process to ensure it's brief and doesn't contain company name
+        words = description.split()
+        if len(words) > COMPANY_DESCRIPTION_LENGTH or company_name.lower() in description.lower():
+            return ""
+        
+        return description if description and "cannot infer" not in description.lower() else ""
+    except Exception:
+        return ""
+
 
 # ─────────────────────────────────────────────────
 # EMBEDDING + EVIDENCE
@@ -467,6 +501,40 @@ def extract_evidence(query: str, cv_text: str, skills: List[str], relevant_secto
         return f"No specific evidence found. General CV preview:\n• {fallback_text}...", "none_partial"
     return "No meaningful content found in CV for evidence.", "none_empty"
 
+async def find_company_for_achievement(client, achievement_text: str, cv_text: str) -> str:
+    """
+    Uses an LLM to find the company associated with an achievement from the CV text,
+    even if the association is not explicit.
+    """
+    prompt = f"""
+You are a meticulous data extraction assistant. Your task is to find the company name associated with a specific achievement mentioned in a CV.
+
+**Instructions:**
+1.  Read the `Achievement Text`.
+2.  Scan the `Full CV Text` to find the most likely company where this achievement was accomplished.
+3.  The company name may be in the same sentence, a nearby sentence, or a job title/company name section close to the achievement.
+4.  Return ONLY the company name as a string. If you cannot confidently find a company, return an empty string.
+
+**Achievement Text:** "{achievement_text}"
+
+**Full CV Text:**
+\"\"\"{cv_text}\"\"\"
+
+Associated Company Name:
+"""
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1
+        )
+        company_name = response.choices[0].message.content.strip()
+        # Basic validation to ensure it's a plausible company name
+        if len(company_name.split()) > 5 or len(company_name) > 50 or not re.search(r'[A-Za-z]', company_name):
+            return ""
+        return company_name
+    except Exception:
+        return ""
 
 async def extract_detailed_candidate_profile(client, cv_text: str, required_skills: List[str], relevant_sectors: List[str]) -> Dict[str, Any]:
     """
@@ -492,10 +560,10 @@ You are a meticulous and literal HR data extraction engine. Your task is to pars
         "Extract 2-3 of the most impactful, QUANTIFIABLE achievements from the CV. These should be direct quotes or tight summaries containing numbers, percentages, or clear business outcomes (e.g., 'Increased user engagement by 25%'). For each achievement, you MUST also identify the company name it was associated with from the CV text. If no such achievements are found, return an empty list []. Format as 'Achievement (at Company Name)'. If the company name cannot be found, just return the achievement."
     ],
     "seniority_indicators": [
-        "STRICTLY extract the specific job titles from the CV text that denote seniority (e.g., 'Senior Product Manager', 'Chief Technology Officer', 'Head of Analytics', 'Director', 'VP'). DO NOT list generic keywords like 'Lead' or 'Manager' unless they are part of an actual senior title in the text. If no senior titles are found, return an empty list []."
+        "STRICTLY extract the specific job titles from the CV text that denote seniority (e.g., 'Senior Product Manager', 'Chief Technology Officer', 'Head of Analytics', 'Director', 'VP'). DO NOT list generic keywords like 'Lead' or 'Manager' unless they are part of an actual senior title in the text. If no senior titles are found, return an empty list]."
     ],
     "technologies_used": [
-        "List specific technologies, software, or programming languages explicitly mentioned in the CV (e.g., 'Python', 'Tableau', 'AWS', 'SAP'). Additionally, infer commonly associated tools or languages if a specific skill or project strongly implies their use (e.g., 'machine learning' implies 'Python', 'TensorFlow', 'PyTorch'). If none are mentioned or implied, return an empty list []."
+        "List specific technologies, software, or programming languages explicitly mentioned in the CV (e.g., 'Python', 'Tableau', 'AWS', 'SAP'). Additionally, infer commonly associated tools or languages if a specific skill or project strongly implies their use (e.g., 'machine learning' implies 'Python', 'TensorFlow', 'PyTorch'). If none are mentioned or implied, return an empty list]."
     ],
     "problem_solving_evidence": "Find and quote ONE concise sentence from the CV that demonstrates a specific problem the candidate solved or an innovative solution they implemented. Avoid generic mission statements. If no direct evidence is found, return the string 'No specific evidence found.'"
 }}
@@ -509,8 +577,38 @@ You are a meticulous and literal HR data extraction engine. Your task is to pars
         )
         content = response.choices[0].message.content
         parsed_profile = json.loads(content)
+        
+        # New robust company name extraction
+        achievements = parsed_profile.get("key_achievements_with_company", [])
+        if not isinstance(achievements, list):
+            achievements = []
+        
+        validated_achievements = []
+        company_tasks = []
+        for ach in achievements:
+            company_name_match = re.search(r'\(at (.*?)\)', ach)
+            if company_name_match:
+                validated_achievements.append(ach)
+            else:
+                # If no explicit company, queue for inference
+                company_tasks.append(find_company_for_achievement(client, ach, cv_text))
+        
+        inferred_companies = await asyncio.gather(*company_tasks)
+        
+        inferred_idx = 0
+        for ach in achievements:
+            company_name_match = re.search(r'\(at (.*?)\)', ach)
+            if not company_name_match:
+                company = inferred_companies[inferred_idx]
+                if company:
+                    validated_achievements.append(f"{ach} (at {company})")
+                else:
+                    validated_achievements.append(ach)
+                inferred_idx += 1
 
-        for key in ["key_achievements_with_company", "seniority_indicators", "technologies_used"]:
+        parsed_profile["key_achievements_with_company"] = validated_achievements
+
+        for key in ["seniority_indicators", "technologies_used"]:
             if not isinstance(parsed_profile.get(key), list):
                 parsed_profile[key] = []
             else:
@@ -542,7 +640,6 @@ You are a meticulous and literal HR data extraction engine. Your task is to pars
             "technologies_used": [],
             "problem_solving_evidence": "No specific evidence found."
         }
-
 # ─────────────────────────────────────────────────
 # SCORING, LOGGING & UI
 # ─────────────────────────────────────────────────
@@ -581,18 +678,31 @@ def calculate_sector_alignment_score(cv_text: str, relevant_sectors: List[str]) 
     return min(score, SECTOR_ALIGNMENT_MAX_POINTS)
 
 
-async def explain_match_gpt_async(client, query: str, evidence: str, detailed_profile: Dict, score_label: str, relevant_sectors: List[str]) -> str:
+async def explain_match_gpt_async(client, query: str, evidence: str, detailed_profile: Dict, score_label: str, relevant_sectors: List[str], company_sectors: Dict[str, str]) -> str:
     """
     Generates a factual, evidence-based explanation for a candidate's fit,
     now with a strong focus on direct, sector-relevant experience.
     """
-    achievements_text = "\n".join([f"- {item}" for item in detailed_profile.get("key_achievements_with_company", []) if item]) or "None specified."
+    achievements_with_sectors = []
+    for ach in detailed_profile.get("key_achievements_with_company", []):
+        company_name_match = re.search(r'\(at (.*?)\)', ach)
+        if company_name_match:
+            company_name = company_name_match.group(1).strip()
+            sector_desc = company_sectors.get(company_name, "")
+            if sector_desc:
+                # NEW: Modify achievement string to include the parenthetical description
+                ach = ach.replace(f"(at {company_name})", f"(at {company_name}, a {sector_desc})")
+        achievements_with_sectors.append(ach)
+    
+    achievements_text = "\n".join([f"- {s}" for s in achievements_with_sectors]) or "None specified."
+    
     seniority_text = ", ".join([item for item in detailed_profile.get("seniority_indicators", []) if item]) or "None specified."
     technologies_text = ", ".join([item for item in detailed_profile.get("technologies_used", []) if item]) or "None specified."
     problem_solving_text = detailed_profile.get('problem_solving_evidence', 'No specific evidence found.')
     relevant_years = detailed_profile.get('relevant_experience_years', 0.0)
     name = detailed_profile.get('name', 'The candidate')
 
+    # NEW: Updated prompt to ensure all achievements are used while maintaining 3 bullet points
     prompt = f"""
 You are a hiring analyst whose goal is to provide a positive, evidence-based summary of a candidate's fit for a role. Your explanation should focus on the candidate's strengths and how their experience, skills, and achievements align with the job requirements.
 
@@ -613,19 +723,18 @@ You are a hiring analyst whose goal is to provide a positive, evidence-based sum
 **Your Task (Strict Instructions):**
 - Write **3 concise, factual bullet points** explaining why this person is a good fit.
 - **You MUST use ONLY the provided "CANDIDATE'S STRENGTHS & EVIDENCE".**
+- **You MUST integrate ALL items from the "Key Achievements" list into your explanation across the three bullet points.**
 - **The first bullet point MUST prioritize a sector-relevant achievement, explicitly citing the company name and explaining how it directly relates to the {', '.join(relevant_sectors)} sectors if possible.**
 - **The second bullet point should focus on a key achievement or problem-solving skill, ideally with quantifiable impact.**
 - **The third bullet point can address leadership, seniority, or technical skills.**
+- **For any company name that has a description in the "Key Achievements" list, you MUST use that exact company name and its parenthetical description in your final output. DO NOT create new descriptions.**
 - **DO NOT** mention or highlight any lack of experience, skills, or achievements. Instead, focus on the positive evidence that is present.
 - **Crucially, avoid making logical leaps or tenuous connections.** The explanation must be directly grounded in the provided evidence. For example, if the requirement is "e-commerce for dental products" and an achievement is "increased retail revenue," state that the candidate has retail experience but DO NOT state they have dental product experience unless the evidence explicitly mentions it.
 - Use neutral, professional language.
 - The tone should reflect the candidate's score. A "Strong Fit" explanation should be more confident than a "Weak Fit" explanation.
-
-**Example for a candidate with a direct sector match:**
-- If the requirement is "solar farm development" and the candidate's achievements mention "Led the development of a 50MW solar farm," the first bullet should state this directly.
-
-**Example for a candidate with no direct sector match but strong skills:**
-- If the requirement is "project management" and the candidate's achievements mention "Led a team of 150 data scientists," the explanation should focus on the leadership and team management aspect. It should NOT say "The candidate has no relevant experience in project management..."
+- Make sure when company name mentioned give its parenthetical description. For Example: MBN Solutions (a boutique corporate finance firm)
+**Example of desired output format:**
+- The candidate has a proven track record of driving business impact, as evidenced by their role in expanding AI and data analytics services at MBN Solutions (a boutique corporate finance firm), which resulted in a 30% revenue increase over three years, highlighting their capability to leverage technology for financial growth.
 
 **Format:**
 - Bullet 1
@@ -754,7 +863,23 @@ async def rerank_and_score(query: str, matches: List[Dict], skills: List[str], r
             cross_probs = [0.0] * len(cross_encoder_pairs)
 
     detailed_profiles_batch = await asyncio.gather(*profile_extraction_tasks)
-
+    
+    # NEW: Extract company names and prepare for sector inference
+    all_companies = set()
+    for profile in detailed_profiles_batch:
+        for achievement in profile.get("key_achievements_with_company", []):
+            company_name_match = re.search(r'\(at (.*?)\)', achievement)
+            if company_name_match:
+                all_companies.add(company_name_match.group(1).strip())
+    
+    company_sector_tasks = {
+        company: infer_company_sector(openai_client, company, cv_texts[i])
+        for i, profile in enumerate(detailed_profiles_batch)
+        for achievement in profile.get("key_achievements_with_company", [])
+        for company in [re.search(r'\(at (.*?)\)', achievement).group(1).strip()] if re.search(r'\(at (.*?)\)', achievement)
+    }
+    company_sectors = {company: await task for company, task in company_sector_tasks.items()}
+    
     explanation_prompts_to_run = []
 
     for i, m in enumerate(matches):
@@ -780,7 +905,7 @@ async def rerank_and_score(query: str, matches: List[Dict], skills: List[str], r
             "evidence": evidence,
             "evidence_source": source,
             "detailed_profile": detailed_profile,
-            "explanation_query": (query, evidence, detailed_profile, score_label_str, relevant_sectors)
+            "explanation_query": (query, evidence, detailed_profile, score_label_str, relevant_sectors, company_sectors) # NEW: Passing company_sectors
         })
 
     explanation_tasks = [
