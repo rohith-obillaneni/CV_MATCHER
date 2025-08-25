@@ -872,14 +872,13 @@ async def rerank_and_score(query: str, matches: List[Dict], skills: List[str], r
             if company_name_match:
                 all_companies.add(company_name_match.group(1).strip())
     
-    company_sector_tasks = {
-        company: infer_company_sector(openai_client, company, cv_texts[i])
+    company_sectors = {
+        company: await infer_company_sector(openai_client, company, cv_texts[i])
         for i, profile in enumerate(detailed_profiles_batch)
         for achievement in profile.get("key_achievements_with_company", [])
         for company in [re.search(r'\(at (.*?)\)', achievement).group(1).strip()] if re.search(r'\(at (.*?)\)', achievement)
     }
-    company_sectors = {company: await task for company, task in company_sector_tasks.items()}
-    
+   
     explanation_prompts_to_run = []
 
     for i, m in enumerate(matches):
