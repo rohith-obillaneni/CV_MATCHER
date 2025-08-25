@@ -878,7 +878,6 @@ async def rerank_and_score(query: str, matches: List[Dict], skills: List[str], r
         for achievement in profile.get("key_achievements_with_company", [])
         for company in [re.search(r'\(at (.*?)\)', achievement).group(1).strip()] if re.search(r'\(at (.*?)\)', achievement)
     }
-   
     explanation_prompts_to_run = []
 
     for i, m in enumerate(matches):
